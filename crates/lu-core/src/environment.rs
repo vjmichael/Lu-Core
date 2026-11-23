@@ -434,7 +434,7 @@ impl EnvironmentStore {
                 "SELECT key FROM env_observations o
                  WHERE id=(SELECT MAX(id) FROM env_observations WHERE key=o.key)
                    AND (checked_at IS NULL
-                        OR (julianday('now')-julianday(checked_at))*86400.0 > ?1)",
+                        OR (julianday('now')-julianday(checked_at))*86400.0 >= ?1)",
             )?;
             let rows = stmt.query_map([max_age.as_secs_f64()], |r| r.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
