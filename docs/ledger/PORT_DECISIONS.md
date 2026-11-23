@@ -71,3 +71,9 @@ Not covered, and reported as such: OCR for scanned PDFs, encrypted PDFs and pass
 Old: Lu-AI-GUI src-tauri/lu-core/src/native_docx_tool.rs, native_pptx_tool.rs, native_spreadsheet_create.rs, native_spreadsheet_tool.rs, native_artifact_inspect.rs. Not ported: `office.rs` writes the OOXML packages itself (zip + escaped XML) and checks them with Lu's own reader, so creation and the created-file check share one parser. No new crate.
 
 Check order: validate spec, build, inspect bytes (unzips, content-type parts exist, XML well formed, read back in order with the expected sections), staged write, inspect the file on disk. Office's own acceptance needs Office: owner test scripts/owner-tests/office-files.ps1 (NOT_TESTED until run). Not covered: images, styles beyond headings/bullets/tables, charts, cell formatting.
+
+## Piece 10c: archives (new, not ported)
+
+Old: Lu-AI-GUI src-tauri/lu-core/src/native_zip_extract*.rs, native_iso9660.rs, native_iso_extract_tool.rs, native_linux_archive*.rs, native_libarchive.rs, native_archive_*.rs. Reviewed native_iso9660.rs: it refused any non-ASCII or Joliet name (most real discs), and the Linux path went through libarchive. Not ported.
+
+New `archive.rs`: zip (zip), tar/tar.gz/tar.xz/tar.bz2/gz (tar, flate2, lzma-rust2, bzip2 with its pure-Rust backend), 7z (sevenz-rust2, CRC checked), ISO 9660 + Joliet (own reader). Same path rules on every system (no absolute, drive, `..`, device names, `:` streams, Windows-invalid characters, case clashes); links and devices skipped; staging folder renamed into place only on success; bytes, entries and expansion ratio counted while writing. Not covered: UDF-only ISOs (reported, 7-Zip suggested), encrypted zip/7z, RAR, bare .xz/.bz2 that are not tarballs.

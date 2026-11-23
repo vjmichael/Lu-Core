@@ -98,7 +98,26 @@ UtilitySpec {
     kind: TaskKind::FileWork,
     trigger: Trigger { extensions: &["xlsx"], phrases: &["spreadsheet", "excel", "workbook", "xlsx"] },
 },
+UtilitySpec {
+    id: "lu_list_archive",
+    description: "List what is inside an archive (zip, tar, tar.gz, tar.xz, tar.bz2, gz, 7z, iso) without extracting it,                   including entries that extraction would skip as unsafe.",
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}"#,
+    need: Need::Required,
+    kind: TaskKind::FileWork,
+    trigger: Trigger { extensions: ARCHIVE_EXTENSIONS, phrases: &["archive", "unzip", "extract", "zip file", "tarball", "disc image", "iso"] },
+},
+UtilitySpec {
+    id: "lu_extract_archive",
+    description: "Extract an archive (zip, tar, tar.gz, tar.xz, tar.bz2, gz, 7z, iso) into a new folder. Works the same on                   Windows and Linux. Unsafe entries (paths escaping the folder, links, device names) are skipped and listed;                   if anything fails, nothing is left half-extracted.",
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string"},"destination":{"type":"string","description":"a folder that does not exist yet"}},"required":["path","destination"],"additionalProperties":false}"#,
+    need: Need::Required,
+    kind: TaskKind::FileWork,
+    trigger: Trigger { extensions: ARCHIVE_EXTENSIONS, phrases: &["unzip", "extract", "unpack", "decompress"] },
+},
 ];
+
+/// Archive formats Lu lists and extracts.
+pub const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "tar", "gz", "tgz", "xz", "txz", "bz2", "tbz2", "tbz", "7z", "iso"];
 
 /// What Lu knows about the task when it builds the model's tool list.
 #[derive(Debug, Clone, Default)]

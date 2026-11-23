@@ -1,7 +1,7 @@
 # Owner test: do Word, PowerPoint and Excel open the files Lu creates?
 #
-# Run from the repository root on a PC with Microsoft Office:
-#   powershell -ExecutionPolicy Bypass -File scripts\owner-tests\office-files.ps1
+# Run on a PC with Microsoft Office, from any folder:
+#   powershell -ExecutionPolicy Bypass -File C:\Lu\scripts\owner-tests\office-files.ps1
 #
 # What it does:
 #   1. Builds the three sample files with Lu's own code (cargo test, the
@@ -13,6 +13,8 @@
 # An app that is not installed is reported as NOT_TESTED, never as a pass.
 
 $ErrorActionPreference = 'Stop'
+# The repository root is two folders up from this script.
+Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 $out = Join-Path ([IO.Path]::GetTempPath()) ("lu-office-test-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $out | Out-Null
 $results = @()

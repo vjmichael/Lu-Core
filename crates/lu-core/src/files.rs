@@ -29,6 +29,8 @@ use sha2::{Digest, Sha256};
 use crate::ansf_operations::{CommandFinish, CommandStart, FileChange};
 use crate::recorder::{RecordError, Recorder};
 use crate::origin::{path_text, Decision, EffectKind, OriginError, OriginGate, Proposal};
+use crate::archive::{self, ArchiveError, ArchiveLimits, ExtractReport, Listing};
+use crate::origin::{Source, SourceKind};
 use crate::reader::{self, Extracted, ReaderError};
 use crate::snapshot::{SnapshotError, SnapshotLimits, SnapshotStore, TrashEntry};
 
@@ -131,6 +133,8 @@ pub enum FileError {
     Origin(OriginError),
     /// A document could not be read (encrypted, no text layer, invalid, ...).
     Document(ReaderError),
+    /// An archive could not be listed or extracted; nothing was left behind.
+    Archive(ArchiveError),
 }
 impl From<OriginError> for FileError {
     fn from(e: OriginError) -> Self {
@@ -518,6 +522,62 @@ impl<'a> FileAccess<'a> {
             let doc = self.extract(call, &target, size, selector, max_chars)?;
             let summary = format!("document {} {} sections, {} chars{}", doc.format.as_str(), doc.total_sections, doc.text.chars().count(), selector.map(|s| format!(" ({s})")).unwrap_or_default());
             Ok((doc, summary))
+        })
+    }
+
+    /// List an archive (zip, tar, tar.gz/.xz/.bz2, gz, 7z, iso) without
+    /// extracting it. Names from an outside archive are untrusted content.
+    pub fn list_archive(&self, call: &Call, path: &Path) -> Result<Listing, FileError> {
+        let target = resolve(path)?;
+        self.recorded(call, "lu.files.list_archive", &target, || {
+            let listing = archive::list(&target).map_err(FileError::Archive)?;
+            if let Some(source) = self.gate.external_file(&target)? {
+                let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+                self.gate.register_content(self.recorder.session_id(), &call.turn_id, &source, &names.join("
+"))?;
+            }
+            let summary = format!(
+                "{} archive, {} entries, {} bytes, {} unsafe",
+                listing.kind.as_str(),
+                listing.total_entries,
+                listing.total_bytes,
+                listing.unsafe_entries.len()
+            );
+            Ok((listing, summary))
+        })
+    }
+
+    /// Extract an archive into `destination`, a new folder inside the
+    /// working scope. Unsafe entries are skipped and reported; a failure or
+    /// limit leaves nothing behind. Files extracted from an outside archive
+    /// are themselves outside files: reading them cannot authorize anything.
+    pub fn extract_archive(&self, call: &Call, path: &Path, destination: &Path, limits: &ArchiveLimits) -> Result<ExtractReport, FileError> {
+        let source_path = resolve(path)?;
+        let target = self.writable_for(call, EffectKind::Write, "lu.files.extract_archive", destination)?;
+        self.recorded(call, "lu.files.extract_archive", &target, || {
+            let report = archive::extract(&source_path, &target, limits).map_err(|e| match e {
+                ArchiveError::DestinationExists(_) => FileError::AlreadyExists,
+                other => FileError::Archive(other),
+            })?;
+            if let Some(outer) = self.gate.external_file(&source_path)? {
+                let source = Source {
+                    kind: SourceKind::ExternalFile,
+                    reference: format!("extracted from {} ({})", source_path.display(), outer.reference),
+                };
+                for rel in &report.written {
+                    let file = rel.split('/').fold(target.clone(), |p, c| p.join(c));
+                    self.gate.mark_external_file(&file, &source)?;
+                }
+            }
+            let summary = format!(
+                "{} archive: {} files, {} folders, {} bytes, {} skipped",
+                report.kind.as_str(),
+                report.files,
+                report.dirs,
+                report.bytes,
+                report.skipped.len()
+            );
+            Ok((report, summary))
         })
     }
 
