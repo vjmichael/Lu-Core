@@ -665,3 +665,10 @@ impl SnapshotStore {
         Ok(original)
     }
 }
+
+impl SnapshotStore {
+    /// The folder a snapshot covers.
+    pub fn scope(&self, id: i64) -> Result<PathBuf, SnapshotError> {
+        Ok(self.info_row(id)?.0)
+    }
+}
