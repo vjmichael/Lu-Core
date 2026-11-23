@@ -1,0 +1,29 @@
+name: ci
+# Verification only. Never gates or merges; all work lands on main.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then
+            cargo build --workspace --all-targets --locked
+            cargo test --workspace --locked
+          else
+            echo "No Cargo workspace yet; nothing to build."
+          fi
