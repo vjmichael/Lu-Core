@@ -7,7 +7,7 @@
 | 2 | Snapshot store + before/after manifest | compiled | snapshot.rs + Recorder::record_changes; tests/snapshot.rs (scope check, limits, Git) pass on Windows (core.autocrlf=true) and CI windows+ubuntu (run 45212425343), commit d73a614; copy limits 1 GiB per snapshot, 256 MiB per file (owner-approved 2026-11-23) |
 | 3 | File access with staged writes | compiled | files.rs + snapshot take_file/trash; tests/files.rs (staged write, stale, universal read/write, scope, trash/copy/move) pass on Windows and CI windows+ubuntu (run 45217048497), commit 25bf25d; document text extraction left to piece 10; working scope default pending owner approval |
 | 4 | Origin tracking | compiled | origin.rs + FileAccess gate. Owner rules 2026-11-23: anything from outside the PC is untrusted; no run/install/delete/send in a turn after untrusted content was read. tests/origin.rs pass on Windows (incl. Mark of the Web) and CI windows+ubuntu (run 45220877829), commit 15cd365 |
-| 5 | Command runner | designed | — |
+| 5 | Command runner | compiled | runner.rs + process_tree.rs; tests/runner.rs (record + changes, timeout no orphan, leftover cleanup, cancel, output trim, background report/stop, held by gate, crash reconcile) pass on Windows (Job Object); Linux process groups: CI pending; setsid escape needs cgroups (not built) |
 | 6 | Loop guard + restore-first | designed | — |
 | 7 | Lu-driven memory injection | designed | — |
 | 8 | Environment facts | designed | — |
