@@ -31,7 +31,7 @@ use std::{
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-/// Copy limits. Defaults are PENDING THE OWNER'S APPROVAL.
+/// Copy limits. Defaults approved by the owner on 2026-11-23.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotLimits {
     /// Most new bytes one snapshot may copy into the blob store.
@@ -41,7 +41,7 @@ pub struct SnapshotLimits {
 }
 impl Default for SnapshotLimits {
     fn default() -> Self {
-        Self { max_total_copy_bytes: 256 * 1024 * 1024, max_file_copy_bytes: 64 * 1024 * 1024 }
+        Self { max_total_copy_bytes: 1024 * 1024 * 1024, max_file_copy_bytes: 256 * 1024 * 1024 }
     }
 }
 
