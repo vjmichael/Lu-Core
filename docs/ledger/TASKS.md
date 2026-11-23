@@ -3,7 +3,7 @@
 | # | Piece | Status | Evidence |
 | --- | --- | --- | --- |
 | 0 | Repo setup: AGENTS.md, CI, ledgers | draft source | Commit on main; CI not yet run |
-| 1 | Generic host-authenticated record in ANSF | compiled | ansf_operations.rs + recorder.rs; tests/recorder.rs (restart continuity, authority, settle, segments) pass on Windows; CI pending |
+| 1 | Generic host-authenticated record in ANSF | compiled | ansf_operations.rs + recorder.rs; tests/recorder.rs (restart continuity, authority, settle, segments) pass on Windows and in CI windows-latest + ubuntu-latest (run 45211299380), commit a0fbddf |
 | 2 | Snapshot store + before/after manifest | designed | — |
 | 3 | File access with staged writes | designed | — |
 | 4 | Origin tracking | designed | — |
