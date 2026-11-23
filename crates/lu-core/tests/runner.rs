@@ -128,11 +128,12 @@ fn a_command_runs_is_recorded_and_its_file_changes_are_reported() {
 fn a_timeout_ends_the_whole_tree_and_leaves_no_orphan() {
     let e = env("timeout");
     runner!(e, rec, run);
-    let req = request(&e, &spawn_grandchild(true), 6, false);
+    // Long enough for PowerShell to start and write pid.txt on a slow CI machine.
+    let req = request(&e, &spawn_grandchild(true), 20, false);
     let started = Instant::now();
     let result = run.run(&req, &CancelToken::default()).unwrap();
     assert!(result.timed_out);
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < Duration::from_secs(45));
     let pid = grandchild(&e.work);
     assert!(gone_soon(pid), "grandchild {pid} still running");
     assert_eq!(e.journal.get(&req.call_id).unwrap().unwrap().state, EffectState::Uncertain);
