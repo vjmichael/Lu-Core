@@ -1,28 +1,35 @@
 //! Origin tracking: every action the model proposes carries where it came
 //! from, and the host decides from that, never from the model's say-so.
 //!
+//! The user is the sole authority. Access is not permission, and permission
+//! is not authority: Lu can reach data from outside the user's PC, but that
+//! data never gets permission to run anything.
+//!
 //! - **The user's instruction** (a host-authenticated turn of the active
 //!   chat), or a step it plainly implies: the action runs, with no prompt.
-//! - **Untrusted external content** (a web page, a downloaded or cloned
-//!   file, a plug-in's output): it has no authority. An action traced to it
-//!   is held, and the user is told once which content asked for it. A
-//!   network send traced to it is refused outright.
+//! - **Anything that came from outside the PC** (a web page, a downloaded
+//!   file, a cloned repository, a remote service's reply) is untrusted.
+//!   An action traced to it is held, and the user is told once which content
+//!   asked for it. A network send traced to it is refused outright.
 //!
-//! How an action is traced, since Lu cannot read the model's mind:
-//! 1. **Marked files.** A file that came from outside carries a mark. An
-//!    action that names a marked file to run is external. A file the model
-//!    writes with text copied from untrusted content gets the mark too, so
-//!    origin travels with the content.
-//! 2. **Copied text.** Untrusted content seen in this conversation is kept as
-//!    overlapping 12-character pieces (normalized). If an action's text
-//!    copies a run of 24 or more characters from it that is not also in the
-//!    user's own instruction, the action was built from that content.
+//! Three rules decide, since Lu cannot read the model's mind:
+//! 1. **No run after reading untrusted content.** Once untrusted content has
+//!    been read in a turn, nothing in that turn may run a command, install,
+//!    delete or send. Those actions are held until the user approves them in
+//!    a new turn. Writing files is still allowed (writing is not running).
+//! 2. **Marked files never run on their own.** A file from outside carries a
+//!    mark: Lu marks what it downloads, and on Windows it also reads the
+//!    Mark of the Web that browsers put on downloads. A file the model writes
+//!    with text copied from untrusted content gets the mark too, so origin
+//!    travels with the content. Running a marked file is held, in any turn.
+//! 3. **Copied text.** Untrusted content seen in the conversation is kept as
+//!    overlapping 12-character pieces. An action in a LATER turn that copies
+//!    a run of 24 or more characters from it, not also in the user's own
+//!    words, is held too.
 //!
-//! Deliberate limits, to keep normal work free of prompts: local files,
-//! command output and recalled memory are recorded but do NOT trigger holds
-//! by text overlap; only untrusted sources do. A copied run shorter than 24
-//! characters is not traced, so short injected commands can get through. Prompt injection cannot be fully
-//! prevented; this limits it, and the journal shows what happened.
+//! Local files, command output and recalled memory originate on the PC and do
+//! not trigger holds. Prompt injection cannot be fully prevented; these rules
+//! limit it, and the journal shows what happened.
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -44,26 +51,33 @@ const SOURCES_PER_SESSION: usize = 32;
 /// Most text kept from one source.
 const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Kinds of content that came from outside the PC. All are untrusted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
     WebPage,
-    /// A downloaded, cloned or otherwise outside file.
+    /// A file that came from outside the PC (downloaded, received, extracted
+    /// from such a file).
     ExternalFile,
-    Plugin,
+    /// A repository cloned or pulled from a remote.
+    RemoteRepository,
+    /// A reply from a remote service or API.
+    RemoteService,
 }
 impl SourceKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::WebPage => "web_page",
             Self::ExternalFile => "external_file",
-            Self::Plugin => "plugin",
+            Self::RemoteRepository => "remote_repository",
+            Self::RemoteService => "remote_service",
         }
     }
     fn parse(v: &str) -> Option<Self> {
         match v {
             "web_page" => Some(Self::WebPage),
             "external_file" => Some(Self::ExternalFile),
-            "plugin" => Some(Self::Plugin),
+            "remote_repository" => Some(Self::RemoteRepository),
+            "remote_service" => Some(Self::RemoteService),
             _ => None,
         }
     }
@@ -213,6 +227,7 @@ impl OriginGate {
              CREATE TABLE IF NOT EXISTS external_content(
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                session_id TEXT NOT NULL,
+               turn_id TEXT NOT NULL,
                source_kind TEXT NOT NULL,
                source_ref TEXT NOT NULL,
                text TEXT NOT NULL,
@@ -220,6 +235,8 @@ impl OriginGate {
              );
              CREATE INDEX IF NOT EXISTS external_content_session
                ON external_content(session_id,id);
+             CREATE INDEX IF NOT EXISTS external_content_turn
+               ON external_content(session_id,turn_id,id);
              CREATE TABLE IF NOT EXISTS held_actions(
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                session_id TEXT NOT NULL,
@@ -238,9 +255,11 @@ impl OriginGate {
         Ok(Self { conn: Mutex::new(conn), cache: Mutex::new(HashMap::new()) })
     }
 
-    /// Record untrusted content the model has seen in this conversation (a
-    /// fetched page, a downloaded file's text, a plug-in's reply).
-    pub fn register_content(&self, session_id: &str, source: &Source, text: &str) -> Result<(), OriginError> {
+    /// Record untrusted content the model has read during a turn (a fetched
+    /// page, an outside file's text, a remote reply). From now on that turn
+    /// may not run, install, delete or send without the user's approval.
+    pub fn register_content(&self, session_id: &str, turn_id: &str, source: &Source, text: &str)
+        -> Result<(), OriginError> {
         let mut cut = text.len().min(MAX_SOURCE_BYTES);
         while !text.is_char_boundary(cut) {
             cut -= 1;
@@ -249,8 +268,9 @@ impl OriginGate {
         {
             let conn = self.conn.lock().map_err(|_| OriginError::Locked)?;
             conn.execute(
-                "INSERT INTO external_content(session_id,source_kind,source_ref,text) VALUES(?1,?2,?3,?4)",
-                params![session_id, source.kind.as_str(), source.reference, text],
+                "INSERT INTO external_content(session_id,turn_id,source_kind,source_ref,text)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![session_id, turn_id, source.kind.as_str(), source.reference, text],
             )?;
         }
         let mut cache = self.cache.lock().map_err(|_| OriginError::Locked)?;
@@ -282,6 +302,23 @@ impl OriginGate {
             .query_row(
                 "SELECT source_kind,source_ref FROM external_files WHERE path_key=?1",
                 [path_key(path)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some(source) = row.and_then(|(k, r)| SourceKind::parse(&k).map(|kind| Source { kind, reference: r })) {
+            return Ok(Some(source));
+        }
+        Ok(mark_of_the_web(path))
+    }
+
+    /// The first untrusted content read in this turn, if any.
+    fn turn_taint(&self, session_id: &str, turn_id: &str) -> Result<Option<Source>, OriginError> {
+        let conn = self.conn.lock().map_err(|_| OriginError::Locked)?;
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT source_kind,source_ref FROM external_content
+                 WHERE session_id=?1 AND turn_id=?2 ORDER BY id LIMIT 1",
+                params![session_id, turn_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -358,17 +395,30 @@ impl OriginGate {
         Ok(None)
     }
 
-    /// The marked file named in an action's text, if any.
+    /// The marked file named in an action's text, if any: one Lu marked, or
+    /// an existing file named in the text that carries the Mark of the Web.
     fn trace_marked_file(&self, text: &str) -> Result<Option<Source>, OriginError> {
         let haystack: String = normalize(text).into_iter().collect();
-        let conn = self.conn.lock().map_err(|_| OriginError::Locked)?;
-        let mut stmt = conn.prepare("SELECT path_key,source_kind,source_ref FROM external_files")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
-        for row in rows {
-            let (key, kind, reference) = row?;
-            if haystack.contains(&key) {
-                if let Some(kind) = SourceKind::parse(&kind) {
-                    return Ok(Some(Source { kind, reference }));
+        {
+            let conn = self.conn.lock().map_err(|_| OriginError::Locked)?;
+            let mut stmt = conn.prepare("SELECT path_key,source_kind,source_ref FROM external_files")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+            for row in rows {
+                let (key, kind, reference) = row?;
+                if haystack.contains(&key) {
+                    if let Some(kind) = SourceKind::parse(&kind) {
+                        return Ok(Some(Source { kind, reference }));
+                    }
+                }
+            }
+        }
+        // Words of the command that name an existing file (quotes removed).
+        for word in text.split(|c: char| c.is_whitespace() || c == '"' || c == '\'') {
+            let path = Path::new(word.trim_start_matches(['@', '&']));
+            if path.is_absolute() && path.is_file() {
+                if let Some(source) = mark_of_the_web(path) {
+                    return Ok(Some(source));
                 }
             }
         }
@@ -388,13 +438,17 @@ impl OriginGate {
         if self.approved(proposal)? {
             return Ok(Decision::Run);
         }
-        let traced = match self.trace_text(&proposal.session_id, &instruction, &proposal.text)? {
-            Some(source) => Some(source),
-            None if matches!(proposal.effect, EffectKind::Execute | EffectKind::Install) => {
-                self.trace_marked_file(&proposal.text)?
-            }
-            None => None,
-        };
+        let runs = matches!(
+            proposal.effect,
+            EffectKind::Execute | EffectKind::Install | EffectKind::Delete | EffectKind::NetworkSend
+        );
+        let mut traced = self.trace_text(&proposal.session_id, &instruction, &proposal.text)?;
+        if traced.is_none() && matches!(proposal.effect, EffectKind::Execute | EffectKind::Install) {
+            traced = self.trace_marked_file(&proposal.text)?;
+        }
+        if traced.is_none() && runs {
+            traced = self.turn_taint(&proposal.session_id, &proposal.turn_id)?;
+        }
         let Some(source) = traced else { return Ok(Decision::Run) };
         let refuse = proposal.effect == EffectKind::NetworkSend;
         let conn = self.conn.lock().map_err(|_| OriginError::Locked)?;
@@ -513,4 +567,29 @@ fn read_held(r: &rusqlite::Row<'_>) -> rusqlite::Result<HeldAction> {
 /// The path text of a file operation, for a [`Proposal`].
 pub fn path_text(what: &str, path: &Path) -> String {
     format!("{what} {}", PathBuf::from(path).display())
+}
+
+/// Windows records where a downloaded file came from in its
+/// `Zone.Identifier` stream (the "Mark of the Web"). Zone 3 (internet) and 4
+/// (restricted) mean the file came from outside the PC.
+#[cfg(windows)]
+fn mark_of_the_web(path: &Path) -> Option<Source> {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    let text = std::fs::read_to_string(PathBuf::from(stream)).ok()?;
+    let field = |name: &str| {
+        text.lines().find_map(|l| l.trim().strip_prefix(name).map(|v| v.trim().to_owned()))
+    };
+    let zone: u32 = field("ZoneId=")?.parse().ok()?;
+    if zone < 3 {
+        return None;
+    }
+    let reference = field("HostUrl=")
+        .or_else(|| field("ReferrerUrl="))
+        .unwrap_or_else(|| format!("Mark of the Web, zone {zone}"));
+    Some(Source { kind: SourceKind::ExternalFile, reference })
+}
+#[cfg(not(windows))]
+fn mark_of_the_web(_path: &Path) -> Option<Source> {
+    None
 }

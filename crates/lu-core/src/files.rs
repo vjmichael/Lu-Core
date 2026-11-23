@@ -443,10 +443,10 @@ impl<'a> FileAccess<'a> {
                 }
                 let bytes = fs::read(&target)?;
                 if let Ok(content) = String::from_utf8(bytes) {
-                    // An outside file's text is untrusted content: actions
-                    // copied from it will be traced back to it.
+                    // An outside file's text is untrusted content: this turn
+                    // may no longer run anything, and copies are traced.
                     if let Some(source) = self.gate.external_file(&target)? {
-                        self.gate.register_content(self.recorder.session_id(), &source, &content)?;
+                        self.gate.register_content(self.recorder.session_id(), &call.turn_id, &source, &content)?;
                     }
                     let digest = sha(content.as_bytes());
                     let summary = format!("text {size} bytes sha256={digest}");
