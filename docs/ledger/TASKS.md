@@ -5,7 +5,7 @@
 | 0 | Repo setup: AGENTS.md, CI, ledgers | draft source | Commit on main; CI not yet run |
 | 1 | Generic host-authenticated record in ANSF | compiled | ansf_operations.rs + recorder.rs; tests/recorder.rs (restart continuity, authority, settle, segments) pass on Windows and in CI windows-latest + ubuntu-latest (run 45211299380), commit a0fbddf |
 | 2 | Snapshot store + before/after manifest | compiled | snapshot.rs + Recorder::record_changes; tests/snapshot.rs (scope check, limits, Git) pass on Windows (core.autocrlf=true) and CI windows+ubuntu (run 45212425343), commit d73a614; copy limits 1 GiB per snapshot, 256 MiB per file (owner-approved 2026-11-23) |
-| 3 | File access with staged writes | compiled | files.rs + snapshot take_file/trash; tests/files.rs (staged write, stale, universal read/write, scope, trash/copy/move) pass on Windows; document text extraction left to piece 10; working scope default pending owner approval |
+| 3 | File access with staged writes | compiled | files.rs + snapshot take_file/trash; tests/files.rs (staged write, stale, universal read/write, scope, trash/copy/move) pass on Windows and CI windows+ubuntu (run 45217048497), commit 25bf25d; document text extraction left to piece 10; working scope default pending owner approval |
 | 4 | Origin tracking | designed | — |
 | 5 | Command runner | designed | — |
 | 6 | Loop guard + restore-first | designed | — |
