@@ -44,11 +44,23 @@ fn parse_kind(value:&str)->Result<GoalEventKind,AnsfError>{
         "respond_question"=>Ok(GoalEventKind::RespondQuestion),
         _=>Err(AnsfError::InvalidInput)}
 }
-fn load_rows(conn:&Connection,session_id:&str)->Result<Vec<GoalEvent>,AnsfError>{
-    let mut stmt=conn.prepare(
+/// Records of the current goal only: everything after the last record that
+/// belongs to a different goal. Setting a new goal clears all questions, so
+/// earlier goals never affect the projection. Loading only this run keeps a
+/// long conversation from hitting the projection's event cap.
+fn load_current_goal(conn:&Connection,session_id:&str)->Result<Vec<GoalEvent>,AnsfError>{
+    let events=load_rows(conn,session_id,
+        "AND seq>COALESCE((SELECT MAX(seq) FROM ansf_goal_records
+           WHERE session_id=?1 AND goal_id<>(SELECT goal_id FROM ansf_goal_records
+             WHERE session_id=?1 ORDER BY seq DESC LIMIT 1)),0)")?;
+    project_goal_events(&events)?;
+    Ok(events)
+}
+fn load_rows(conn:&Connection,session_id:&str,filter:&str)->Result<Vec<GoalEvent>,AnsfError>{
+    let mut stmt=conn.prepare(&format!(
         "SELECT event_id,goal_id,question_id,kind,text,choice,comment
-         FROM ansf_goal_records WHERE session_id=?1 ORDER BY seq"
-    )?;
+         FROM ansf_goal_records WHERE session_id=?1 {filter} ORDER BY seq"
+    ))?;
     let rows=stmt.query_map([session_id],|r|{
         Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,
             r.get::<_,Option<String>>(2)?,r.get::<_,String>(3)?,
@@ -62,21 +74,23 @@ fn load_rows(conn:&Connection,session_id:&str)->Result<Vec<GoalEvent>,AnsfError>
             kind:parse_kind(&kind)?,text,choice,comment};
         event.validate()?;
         result.push(event);
-        if result.len()>1024{return Err(AnsfError::InvalidInput)}
     }
-    project_goal_events(&result)?;
     Ok(result)
 }
+fn valid_session(session_id:&str)->bool{
+    !session_id.is_empty()&&session_id.len()<=128&&!session_id.contains('\0')
+}
 impl AnsfStore{
+    /// Every goal record of the conversation, oldest first.
     pub fn native_goal_records(&self,session_id:&str)->Result<Vec<GoalEvent>,AnsfError>{
-        if session_id.is_empty()||session_id.len()>128||session_id.contains('\0'){
-            return Err(AnsfError::InvalidInput)
-        }
+        if !valid_session(session_id){return Err(AnsfError::InvalidInput)}
         let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
-        load_rows(&conn,session_id)
+        load_rows(&conn,session_id,"")
     }
     pub fn native_goal_snapshot(&self,session_id:&str)->Result<GoalSnapshot,AnsfError>{
-        project_goal_events(&self.native_goal_records(session_id)?)
+        if !valid_session(session_id){return Err(AnsfError::InvalidInput)}
+        let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
+        project_goal_events(&load_current_goal(&conn,session_id)?)
     }
     /// Appends a verified UI-host decision. Old imported goal answers must
     /// instead use import_observed_goal_record; they are historical data only.
@@ -91,9 +105,7 @@ impl AnsfStore{
     fn append_record(&self,session_id:&str,event:&GoalEvent,origin:&str,idempotent:bool)
         ->Result<GoalSnapshot,AnsfError>{
         event.validate()?;
-        if session_id.is_empty()||session_id.len()>128||session_id.contains('\0'){
-            return Err(AnsfError::InvalidInput)
-        }
+        if !valid_session(session_id){return Err(AnsfError::InvalidInput)}
         let mut conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
         let tx=conn.transaction()?;
         let existing:Option<(String,GoalEvent)>=tx.query_row(
@@ -113,11 +125,14 @@ impl AnsfStore{
         }).transpose()?;
         if let Some((saved_origin,old))=existing{
             if idempotent&&saved_origin==origin&&old==*event {
-                return project_goal_events(&load_rows(&tx,session_id)?)
+                return project_goal_events(&load_current_goal(&tx,session_id)?)
             }
             return Err(AnsfError::InvalidInput)
         }
-        let mut prior=load_rows(&tx,session_id)?;
+        // A new goal starts from nothing; otherwise continue the current run.
+        let current=load_current_goal(&tx,session_id)?;
+        let continues=current.last().is_some_and(|e|e.goal_id==event.goal_id);
+        let mut prior=if continues{current}else{Vec::new()};
         prior.push(event.clone());
         let state=project_goal_events(&prior)?;
         tx.execute(
@@ -138,6 +153,29 @@ mod tests{
         GoalEvent{event_id:format!("m-{n:032x}"),goal_id:format!("goal-{:032x}",1),
             question_id:q,kind:k,text:text.into(),
             choice:choice.map(str::to_owned),comment:None}
+    }
+    #[test]
+    fn long_conversation_with_many_goals_never_locks_out(){
+        let store=AnsfStore::in_memory().unwrap();
+        store.create_session("c-long","local","Long").unwrap();
+        // 1,200 records across 600 goals; the old code refused everything
+        // after 1,024 records in a conversation.
+        for g in 0..600u32{
+            let goal=format!("goal-{g:032x}");
+            let q=format!("q-{g:032x}");
+            let set=GoalEvent{event_id:format!("m-{:032x}",g*2),goal_id:goal.clone(),
+                question_id:None,kind:GoalEventKind::SetGoal,text:format!("Goal {g}"),
+                choice:None,comment:None};
+            let ask=GoalEvent{event_id:format!("m-{:032x}",g*2+1),goal_id:goal,
+                question_id:Some(q),kind:GoalEventKind::AskQuestion,text:"Ready?".into(),
+                choice:None,comment:None};
+            store.append_native_goal_record("c-long",&set).unwrap();
+            store.append_native_goal_record("c-long",&ask).unwrap();
+        }
+        let state=store.native_goal_snapshot("c-long").unwrap();
+        assert_eq!(state.goal,"Goal 599");
+        assert_eq!(state.questions.len(),1);
+        assert_eq!(store.native_goal_records("c-long").unwrap().len(),1200);
     }
     #[test]
     fn relational_goal_records_no_json_and_explicit_deferral(){

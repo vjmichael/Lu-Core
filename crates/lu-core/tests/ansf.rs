@@ -249,3 +249,23 @@ fn invalid_ids_unbounded_pages_and_entries_without_topic_are_denied() {
     drop(store);
     let _ = std::fs::remove_file(db);
 }
+
+#[test]
+fn search_treats_query_text_literally() {
+    let store = AnsfStore::open(&std::env::temp_dir().join(format!(
+        "lu-ansf-literal-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ))).unwrap();
+    store.create_session("chat", "lu", "Search").unwrap();
+    store.start_chapter("chat", "One").unwrap();
+    store.append_entry("chat", "m-1", EntryRole::User, "build", "Build with C++ and NOT Rust").unwrap();
+    // FTS5 syntax in a query used to be passed through: these were errors
+    // or changed meaning (NOT, column filter, unbalanced quote).
+    for query in ["C++", "NOT", "summary:Build", "\"unbalanced", "Rust OR"] {
+        assert!(store.search("chat", query, 5).is_ok(), "{query}");
+        assert!(store.search_current_messages("chat", query, 5).is_ok(), "{query}");
+    }
+    assert_eq!(store.search("chat", "NOT Rust", 5).unwrap().len(), 1);
+    assert!(store.search("chat", "summary:Build", 5).unwrap().is_empty());
+}

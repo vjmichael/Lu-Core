@@ -1,11 +1,10 @@
-//! M2 canonical Lu chat events: original history in ANSF SQLite, not JSONL.
+//! Lu chat events: the original conversation history, stored in ANSF SQLite.
 //!
-//! Protobuf remains Lu's internal IPC; SQLite uses relational columns.
-//! A legacy JSONL reader may import observed records, but those records are
+//! A legacy-chat importer may add observed records, but those records are
 //! NOT authenticated current human turns and never become tool authority.
 //! The host owns identity issuance, profile/ownership validation and dispatch.
 use rusqlite::{params,Connection,OptionalExtension};
-use crate::ansf::{AnsfError,AnsfStore,Entry};
+use crate::ansf::{AnsfError,AnsfStore,Entry,ENTRY_COLUMNS_E};
 
 pub const MAX_LIVE_TEXT_BYTES:usize=2*1024*1024;
 pub const MAX_LIVE_EVENTS_PAGE:usize=100;
@@ -13,7 +12,7 @@ pub const MAX_LIVE_EVENTS_PAGE:usize=100;
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
 pub enum LiveKind{
     User,ReaderUser,AssistantFinal,AssistantProgress,
-    AssistantCompleted,AssistantCancelled,BrowserObservation,
+    AssistantCompleted,AssistantCancelled,
 }
 impl LiveKind{
     fn as_str(self)->&'static str{
@@ -24,7 +23,6 @@ impl LiveKind{
             Self::AssistantProgress=>"assistant_progress",
             Self::AssistantCompleted=>"assistant_completed",
             Self::AssistantCancelled=>"assistant_cancelled",
-            Self::BrowserObservation=>"browser_observation",
         }
     }
     fn parse(value:&str)->Result<Self,AnsfError>{
@@ -34,7 +32,6 @@ impl LiveKind{
             "assistant_progress"=>Ok(Self::AssistantProgress),
             "assistant_completed"=>Ok(Self::AssistantCompleted),
             "assistant_cancelled"=>Ok(Self::AssistantCancelled),
-            "browser_observation"=>Ok(Self::BrowserObservation),
             _=>Err(AnsfError::InvalidInput),
         }
     }
@@ -64,8 +61,6 @@ pub struct LiveEvent{
     /// Historical imported turn identity, retained for auditing, NEVER tool authority.
     pub legacy_turn_id:Option<String>,
     pub generation_id:Option<String>,
-    pub call_id:Option<String>,
-    pub tool_id:Option<String>,
 }
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct StoredLiveEvent{
@@ -84,80 +79,61 @@ pub struct VisibleChatMessage{
     pub cancelled:bool,
 }
 
+const EVENT_COLUMNS:&str=
+    "seq,session_id,event_id,kind,text,user_turn_id,legacy_turn_id,generation_id,origin,source_entry_id";
+
 fn opaque(value:&str,expected:&str)->bool{
     value.len()==expected.len()+32&&value.starts_with(expected)&&
         value[expected.len()..].bytes().all(|v|v.is_ascii_hexdigit()&&!v.is_ascii_uppercase())
 }
+fn bounded(s:&str)->bool{!s.is_empty()&&s.len()<=128&&!s.contains('\0')}
 fn valid_session(s:&str)->bool{!s.trim().is_empty()&&s.len()<=128&&!s.contains('\0')}
 impl LiveEvent{
     fn validate(&self,origin:LiveOrigin)->Result<(),AnsfError>{
+        let host=origin==LiveOrigin::HostAuthenticated;
         if !opaque(&self.event_id,"e-")||
            self.text.len()>MAX_LIVE_TEXT_BYTES||self.text.contains('\0'){
             return Err(AnsfError::InvalidInput)
         }
-        let valid_generation=|s:&str| if origin==LiveOrigin::HostAuthenticated {
-            opaque(s,"g-")
-        } else { !s.is_empty()&&s.len()<=128&&!s.contains('\0') };
-        let valid_call=|s:&str| if origin==LiveOrigin::HostAuthenticated {
-            opaque(s,"browser-call-")
-        } else { !s.is_empty()&&s.len()<=128&&!s.contains('\0') };
+        // Host generations are host-minted; legacy ones are only bounded text.
+        let valid_generation=|s:&str| if host {opaque(s,"g-")} else {bounded(s)};
         if self.user_turn_id.as_deref().is_some_and(|s|!opaque(s,"g-"))||
-           self.generation_id.as_deref().is_some_and(|s|!valid_generation(s))||
-           self.call_id.as_deref().is_some_and(|s|!valid_call(s)){
+           self.generation_id.as_deref().is_some_and(|s|!valid_generation(s)){
             return Err(AnsfError::InvalidInput)
         }
-        if self.legacy_turn_id.as_ref().is_some_and(|s|
-            origin!=LiveOrigin::LegacyObserved||self.kind!=LiveKind::User||
-            s.is_empty()||s.len()>128||s.contains('\0')){
-            return Err(AnsfError::InvalidInput)
-        }
-        if self.tool_id.as_ref().is_some_and(|s|s.len()>128||s.contains('\0')){
+        if self.legacy_turn_id.as_deref().is_some_and(|s|
+            host||self.kind!=LiveKind::User||!bounded(s)){
             return Err(AnsfError::InvalidInput)
         }
         let ok=match self.kind{
-            LiveKind::User=>
-                (origin==LiveOrigin::LegacyObserved||!self.text.is_empty())&&
-                self.generation_id.is_none()&&
-                self.call_id.is_none()&&self.tool_id.is_none()&&
-                (origin==LiveOrigin::LegacyObserved && self.user_turn_id.is_none() ||
-                 origin==LiveOrigin::HostAuthenticated &&
-                 self.user_turn_id.as_deref().is_none_or(|s|opaque(s,"g-"))),
-            LiveKind::ReaderUser=>
-                !self.text.is_empty()&&
-                self.generation_id.is_some()&&self.user_turn_id.is_none()&&
-                self.call_id.is_none()&&self.tool_id.is_none(),
+            // A host user turn has text; only a host turn may carry a turn ID.
+            LiveKind::User=>self.generation_id.is_none()&&
+                if host {!self.text.is_empty()} else {self.user_turn_id.is_none()},
+            LiveKind::ReaderUser=>!self.text.is_empty()&&
+                self.generation_id.is_some()&&self.user_turn_id.is_none(),
             LiveKind::AssistantFinal=>
-                self.user_turn_id.is_none()&&
-                self.generation_id.is_none()&&self.call_id.is_none()&&self.tool_id.is_none(),
+                self.user_turn_id.is_none()&&self.generation_id.is_none(),
             LiveKind::AssistantProgress=>
-                self.generation_id.is_some()&&self.user_turn_id.is_none()&&
-                self.call_id.is_none()&&self.tool_id.is_none(),
+                self.generation_id.is_some()&&self.user_turn_id.is_none(),
             LiveKind::AssistantCompleted|LiveKind::AssistantCancelled=>
-                self.text.is_empty()&&self.generation_id.is_some()&&
-                self.user_turn_id.is_none()&&self.call_id.is_none()&&self.tool_id.is_none(),
-            LiveKind::BrowserObservation=>
-                self.generation_id.is_some()&&self.call_id.is_some()&&
-                self.tool_id.as_deref()==Some("lu_browser_read")&&
-                !self.text.is_empty()&&self.text.len()<=3200&&self.user_turn_id.is_none(),
+                self.text.is_empty()&&self.generation_id.is_some()&&self.user_turn_id.is_none(),
         };
         if !ok{return Err(AnsfError::InvalidInput)}
         Ok(())
     }
 }
-fn map_row(r:&rusqlite::Row<'_>)->rusqlite::Result<(i64,String,String,String,
-    String,Option<String>,Option<String>,Option<String>,Option<String>,Option<String>,String,Option<i64>)>{
-    Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,
-        r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?))
-}
-fn decode(row:(i64,String,String,String,String,Option<String>,Option<String>,
-    Option<String>,Option<String>,Option<String>,String,Option<i64>))->Result<StoredLiveEvent,AnsfError>{
-    let(seq,session_id,event_id,kind,text,user_turn_id,legacy_turn_id,generation_id,
-        call_id,tool_id,origin,source_entry_id)=row;
-    let origin=LiveOrigin::parse(&origin)?;
-    let event=LiveEvent{event_id,kind:LiveKind::parse(&kind)?,text,
-        user_turn_id,legacy_turn_id,generation_id,call_id,tool_id};
-    event.validate(origin)?;
-    Ok(StoredLiveEvent{seq,session_id,event,origin,source_entry_id})
+fn read_event(r:&rusqlite::Row<'_>)->rusqlite::Result<Result<StoredLiveEvent,AnsfError>>{
+    let kind:String=r.get(3)?;
+    let origin:String=r.get(8)?;
+    let parsed=(||{
+        let origin=LiveOrigin::parse(&origin)?;
+        let event=LiveEvent{event_id:r.get(2)?,kind:LiveKind::parse(&kind)?,text:r.get(4)?,
+            user_turn_id:r.get(5)?,legacy_turn_id:r.get(6)?,generation_id:r.get(7)?};
+        event.validate(origin)?;
+        Ok(StoredLiveEvent{seq:r.get(0)?,session_id:r.get(1)?,event,origin,
+            source_entry_id:r.get(9)?})
+    })();
+    Ok(parsed)
 }
 pub(crate) fn initialize_live_chat_schema(conn:&Connection)->Result<(),AnsfError>{
     conn.execute_batch(
@@ -167,19 +143,19 @@ pub(crate) fn initialize_live_chat_schema(conn:&Connection)->Result<(),AnsfError
            event_id TEXT NOT NULL UNIQUE,
            kind TEXT NOT NULL CHECK(kind IN
              ('user','reader_user','assistant_final','assistant_progress',
-              'assistant_completed','assistant_cancelled','browser_observation')),
+              'assistant_completed','assistant_cancelled')),
            text TEXT NOT NULL,
            user_turn_id TEXT,
            legacy_turn_id TEXT,
            generation_id TEXT,
-           call_id TEXT,
-           tool_id TEXT,
            origin TEXT NOT NULL CHECK(origin IN ('host','legacy')),
            source_entry_id INTEGER REFERENCES ansf_entries(id),
            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
          );
          CREATE INDEX IF NOT EXISTS ansf_live_chat_event_cursor
            ON ansf_live_chat_events(session_id,seq);
+         CREATE INDEX IF NOT EXISTS ansf_live_chat_generation
+           ON ansf_live_chat_events(session_id,generation_id,kind);
          CREATE UNIQUE INDEX IF NOT EXISTS ansf_live_authenticated_user
            ON ansf_live_chat_events(session_id,user_turn_id)
            WHERE kind='user' AND origin='host' AND user_turn_id IS NOT NULL;
@@ -193,24 +169,10 @@ pub(crate) fn initialize_live_chat_schema(conn:&Connection)->Result<(),AnsfError
          CREATE TRIGGER IF NOT EXISTS ansf_live_chat_no_delete
            BEFORE DELETE ON ansf_live_chat_events BEGIN
              SELECT RAISE(ABORT,'ANSF live original events are immutable');
-           END;"
-    )?;
-    // Development/pre-release books may already have the first native event
-    // table without its separate observed-legacy identity column.
-    // Add this nullable provenance field without rewriting any original row.
-    let mut cols=conn.prepare("PRAGMA table_info(ansf_live_chat_events)")?;
-    let names=cols.query_map([],|r|r.get::<_,String>(1))?
-        .collect::<Result<Vec<_>,_>>()?;
-    drop(cols);
-    if !names.iter().any(|s|s=="legacy_turn_id"){
-        conn.execute_batch(
-            "ALTER TABLE ansf_live_chat_events ADD COLUMN legacy_turn_id TEXT"
-        )?;
-    }
-    // Derived pointer-only display projection: no text, no copied model
-    // instructions and no second authoritative conversation database.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ansf_visible_chat(
+           END;
+         -- Derived pointer-only display projection: no text, no copied model
+         -- instructions and no second authoritative conversation database.
+         CREATE TABLE IF NOT EXISTS ansf_visible_chat(
            session_id TEXT NOT NULL REFERENCES ansf_sessions(id),
            first_seq INTEGER NOT NULL REFERENCES ansf_live_chat_events(seq),
            latest_event_seq INTEGER NOT NULL REFERENCES ansf_live_chat_events(seq),
@@ -223,12 +185,13 @@ pub(crate) fn initialize_live_chat_schema(conn:&Connection)->Result<(),AnsfError
          CREATE INDEX IF NOT EXISTS ansf_visible_chat_cursor
            ON ansf_visible_chat(session_id,first_seq);"
     )?;
-    let existing:i64=conn.query_row(
-        "SELECT COUNT(*) FROM ansf_visible_chat",[],|r|r.get(0)
-    )?;
-    if existing==0 {
-        // One-time legacy projection rebuild. Long-lived books do NOT rescan
-        // all historical progress events on every open.
+    let projected:bool=conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ansf_visible_chat)",[],|r|r.get(0))?;
+    let has_events:bool=conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ansf_live_chat_events)",[],|r|r.get(0))?;
+    if !projected && has_events {
+        // Rebuild the derived projection from the immutable originals, e.g.
+        // after the table was lost. Never runs on a book with a projection.
         conn.execute_batch(
             "INSERT OR IGNORE INTO ansf_visible_chat
              (session_id,first_seq,latest_event_seq,generation_id,role,status)
@@ -261,12 +224,12 @@ pub(crate) fn initialize_live_chat_schema(conn:&Connection)->Result<(),AnsfError
 impl AnsfStore{
     /// Append an original host-authenticated Lu event directly to SQLite.
     /// This API is for the trusted host only, never for model-supplied JSON,
-    /// imported transcripts or generic MCP calls.
+    /// imported transcripts or generic tool calls.
     pub fn append_host_chat_event(&self,session_id:&str,event:&LiveEvent)
         ->Result<StoredLiveEvent,AnsfError>{
         self.append_live_chat_event(session_id,event,LiveOrigin::HostAuthenticated,false)
     }
-    /// Boundary-only migration of old JSONL events. Never authenticates a
+    /// Boundary-only migration of old chat events. Never authenticates a
     /// historical User record, even if its source contains a generation ID.
     /// Exact replay is idempotent; same ID with changed content fails.
     pub fn import_legacy_chat_event(&self,session_id:&str,event:&LiveEvent)
@@ -279,12 +242,10 @@ impl AnsfStore{
         event.validate(origin)?;
         let mut conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
         let tx=conn.transaction()?;
-        let exists:Option<StoredLiveEvent>=tx.query_row(
-            "SELECT seq,session_id,event_id,kind,text,user_turn_id,legacy_turn_id,generation_id,
-                    call_id,tool_id,origin,source_entry_id
-             FROM ansf_live_chat_events WHERE event_id=?1",
-            [&event.event_id],map_row
-        ).optional()?.map(decode).transpose()?;
+        let exists=tx.query_row(
+            &format!("SELECT {EVENT_COLUMNS} FROM ansf_live_chat_events WHERE event_id=?1"),
+            [&event.event_id],read_event
+        ).optional()?.transpose()?;
         if let Some(saved)=exists{
             if idempotent && saved.session_id==session_id&&
                saved.event==*event&&saved.origin==origin{return Ok(saved)}
@@ -294,44 +255,34 @@ impl AnsfStore{
             "SELECT id FROM ansf_chapters WHERE session_id=?1 AND closed=0",
             [session_id],|r|r.get(0)).optional()?;
         let chapter=active_chapter.ok_or(AnsfError::NoActiveChapter)?;
-        // Complete events are not generated from arbitrary model text;
-        // only the host's live generation ID may finish its recorded stream.
-        let completed_text=if event.kind==LiveKind::AssistantCompleted {
-            tx.query_row(
-                "SELECT text FROM ansf_live_chat_events
-                 WHERE session_id=?1 AND generation_id=?2
-                   AND kind='assistant_progress'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id,event.generation_id],
-                |r|r.get::<_,String>(0)
-            ).optional()?
-        }else{None};
-        if matches!(event.kind,LiveKind::AssistantCompleted|LiveKind::AssistantCancelled){
-            let previous:i64=tx.query_row(
-                "SELECT COUNT(*) FROM ansf_live_chat_events
-                 WHERE session_id=?1 AND generation_id=?2
-                 AND kind IN ('assistant_completed','assistant_cancelled')",
-                params![session_id,event.generation_id],|r|r.get(0))?;
-            if previous!=0{return Err(AnsfError::InvalidInput)}
+        // A stream is: one or more progress events, then at most one terminal
+        // event. Nothing may follow the terminal event, and a terminal event
+        // needs a stream to end.
+        let mut completed_text=None;
+        if matches!(event.kind,LiveKind::AssistantProgress|
+            LiveKind::AssistantCompleted|LiveKind::AssistantCancelled){
+            let (terminal,latest):(bool,Option<String>)=tx.query_row(
+                "SELECT
+                   EXISTS(SELECT 1 FROM ansf_live_chat_events
+                     WHERE session_id=?1 AND generation_id=?2
+                       AND kind IN ('assistant_completed','assistant_cancelled')),
+                   (SELECT text FROM ansf_live_chat_events
+                     WHERE session_id=?1 AND generation_id=?2 AND kind='assistant_progress'
+                     ORDER BY seq DESC LIMIT 1)",
+                params![session_id,event.generation_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+            if terminal||(event.kind!=LiveKind::AssistantProgress&&latest.is_none()){
+                return Err(AnsfError::InvalidInput)
+            }
+            if event.kind==LiveKind::AssistantCompleted{completed_text=latest}
         }
-        if event.kind==LiveKind::BrowserObservation && origin==LiveOrigin::HostAuthenticated{
-            let trusted:i64=tx.query_row(
-                "SELECT COUNT(*) FROM ansf_live_chat_events
-                 WHERE session_id=?1 AND origin='host' AND kind='user'
-                 AND user_turn_id=?2",
-                params![session_id,event.generation_id],|r|r.get(0))?;
-            if trusted!=1{return Err(AnsfError::InvalidInput)}
-        }
-        let source_data=match event.kind {
-            LiveKind::User|LiveKind::ReaderUser=>
-                Some(("user",event.text.as_str(),event.event_id.as_str())),
-            LiveKind::AssistantFinal=>
-                Some(("assistant",event.text.as_str(),event.event_id.as_str())),
-            LiveKind::AssistantCompleted if completed_text.as_deref().is_some_and(|s|!s.is_empty())=>
-                Some(("assistant",completed_text.as_deref().unwrap_or(""),event.event_id.as_str())),
+        let source_text=match event.kind {
+            LiveKind::User|LiveKind::ReaderUser=>Some(("user",event.text.as_str())),
+            LiveKind::AssistantFinal=>Some(("assistant",event.text.as_str())),
+            LiveKind::AssistantCompleted=>completed_text.as_deref()
+                .filter(|s|!s.is_empty()).map(|s|("assistant",s)),
             _=>None,
         };
-        let source_entry_id=if let Some((role,text,msg_id))=source_data{
+        let source_entry_id=if let Some((role,text))=source_text{
             // Preserve exact original; generated summaries are navigation aids,
             // not the model's authority and not replacements for source text.
             let summary:String=text.chars().take(160).collect();
@@ -339,28 +290,31 @@ impl AnsfStore{
                 "INSERT INTO ansf_entries
                  (session_id,chapter_id,message_id,role,summary,content)
                  VALUES(?1,?2,?3,?4,?5,?6)",
-                params![session_id,chapter,msg_id,role,summary,text],
+                params![session_id,chapter,event.event_id,role,summary,text],
             )?;
-            Some(tx.last_insert_rowid())
+            let entry_id=tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE ansf_chapters
+                 SET start_entry_id=COALESCE(start_entry_id,?1),end_entry_id=?1 WHERE id=?2",
+                params![entry_id,chapter],
+            )?;
+            Some(entry_id)
         }else{None};
         tx.execute(
             "INSERT INTO ansf_live_chat_events
-             (session_id,event_id,kind,text,user_turn_id,legacy_turn_id,generation_id,call_id,
-              tool_id,origin,source_entry_id)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             (session_id,event_id,kind,text,user_turn_id,legacy_turn_id,generation_id,
+              origin,source_entry_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![session_id,event.event_id,event.kind.as_str(),
                 event.text,event.user_turn_id,event.legacy_turn_id,event.generation_id,
-                event.call_id,event.tool_id,origin.as_str(),source_entry_id],
+                origin.as_str(),source_entry_id],
         )?;
         let seq=tx.last_insert_rowid();
-        // A bounded display index points to the actual original event text.
-        // Stream checkpoints update only the last-event pointer; they do not
-        // duplicate megabytes of text in a second transcript.
+        // The display index points to the original event text. Stream
+        // checkpoints move only the last-event pointer; no text is duplicated.
         match event.kind{
             LiveKind::User|LiveKind::ReaderUser|LiveKind::AssistantFinal=>{
-                let role=if matches!(event.kind,LiveKind::AssistantFinal){
-                    "assistant"
-                }else{"user"};
+                let role=if event.kind==LiveKind::AssistantFinal{"assistant"}else{"user"};
                 tx.execute(
                     "INSERT INTO ansf_visible_chat
                      (session_id,first_seq,latest_event_seq,generation_id,role,status)
@@ -370,37 +324,22 @@ impl AnsfStore{
             }
             LiveKind::AssistantProgress=>{
                 tx.execute(
-                    "INSERT OR IGNORE INTO ansf_visible_chat
+                    "INSERT INTO ansf_visible_chat
                      (session_id,first_seq,latest_event_seq,generation_id,role,status)
-                     VALUES(?1,?2,?2,?3,'assistant','interrupted')",
+                     VALUES(?1,?2,?2,?3,'assistant','interrupted')
+                     ON CONFLICT(session_id,generation_id)
+                     DO UPDATE SET latest_event_seq=excluded.latest_event_seq",
                     params![session_id,seq,event.generation_id]
-                )?;
-                tx.execute(
-                    "UPDATE ansf_visible_chat SET latest_event_seq=?1
-                     WHERE session_id=?2 AND generation_id=?3
-                     AND status='interrupted' AND latest_event_seq<?1",
-                    params![seq,session_id,event.generation_id]
                 )?;
             }
             LiveKind::AssistantCompleted|LiveKind::AssistantCancelled=>{
-                let status=if event.kind==LiveKind::AssistantCompleted{
-                    "final"
-                }else{"cancelled"};
+                let status=if event.kind==LiveKind::AssistantCompleted{"final"}else{"cancelled"};
                 tx.execute(
                     "UPDATE ansf_visible_chat SET status=?1
                      WHERE session_id=?2 AND generation_id=?3",
                     params![status,session_id,event.generation_id]
                 )?;
             }
-            LiveKind::BrowserObservation=>{}
-        }
-        if let Some(entry_id)=source_entry_id {
-            tx.execute(
-                "UPDATE ansf_chapters
-                 SET start_entry_id=COALESCE(start_entry_id,?1),
-                     end_entry_id=?1 WHERE id=?2",
-                params![entry_id,chapter],
-            )?;
         }
         tx.commit()?;
         Ok(StoredLiveEvent{seq,session_id:session_id.to_owned(),
@@ -425,20 +364,13 @@ impl AnsfStore{
             return Err(AnsfError::InvalidInput)
         }
         let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
-        let sql=if forward{
+        let (cmp,order)=if forward{(">","ASC")}else{("<","DESC")};
+        let mut stmt=conn.prepare(&format!(
             "SELECT d.first_seq,d.role,d.status,e.text
              FROM ansf_visible_chat d
              JOIN ansf_live_chat_events e ON d.latest_event_seq=e.seq
-             WHERE d.session_id=?1 AND d.first_seq>?2
-             ORDER BY d.first_seq ASC LIMIT ?3"
-        }else{
-            "SELECT d.first_seq,d.role,d.status,e.text
-             FROM ansf_visible_chat d
-             JOIN ansf_live_chat_events e ON d.latest_event_seq=e.seq
-             WHERE d.session_id=?1 AND d.first_seq<?2
-             ORDER BY d.first_seq DESC LIMIT ?3"
-        };
-        let mut stmt=conn.prepare(sql)?;
+             WHERE d.session_id=?1 AND d.first_seq{cmp}?2
+             ORDER BY d.first_seq {order} LIMIT ?3"))?;
         let mut entries=stmt.query_map(
             params![session_id,cursor,(limit+1) as i64],|r|{
                 let status:String=r.get(2)?;
@@ -474,71 +406,13 @@ impl AnsfStore{
         if !valid_session(session_id)||after_seq<0||limit==0||
            limit>MAX_LIVE_EVENTS_PAGE{return Err(AnsfError::InvalidInput)}
         let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
-        let mut stmt=conn.prepare(
-            "SELECT seq,session_id,event_id,kind,text,user_turn_id,legacy_turn_id,generation_id,
-                    call_id,tool_id,origin,source_entry_id
-             FROM ansf_live_chat_events
-             WHERE session_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3"
-        )?;
-        let rows=stmt.query_map(params![session_id,after_seq,limit as i64],map_row)?;
+        let mut stmt=conn.prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM ansf_live_chat_events
+             WHERE session_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3"))?;
+        let rows=stmt.query_map(params![session_id,after_seq,limit as i64],read_event)?;
         let mut result=Vec::new();
-        for row in rows{result.push(decode(row?)?)}
+        for row in rows{result.push(row??)}
         Ok(result)
-    }
-    /// Indexed, bounded terminal/notice lookup for one exact reviewed turn.
-    /// Avoid reconstructing the entire potentially infinite ANSF chat stream.
-    pub fn reviewed_turn_recovery_state(
-        &self,session_id:&str,turn_id:&str,exact_notice:&str
-    )->Result<(bool,bool),AnsfError>{
-        if !valid_session(session_id)||!opaque(turn_id,"g-")
-            ||exact_notice.is_empty()||exact_notice.len()>512{
-            return Err(AnsfError::InvalidInput)
-        }
-        let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
-        let (terminal,notified):(i64,i64)=conn.query_row(
-            "SELECT
-              EXISTS(SELECT 1 FROM ansf_live_chat_events
-                WHERE session_id=?1 AND generation_id=?2
-                  AND kind IN ('assistant_completed','assistant_cancelled')),
-              EXISTS(SELECT 1 FROM ansf_live_chat_events
-                WHERE session_id=?1 AND generation_id=?2
-                  AND kind='assistant_progress' AND text=?3)",
-            params![session_id,turn_id,exact_notice],
-            |row|Ok((row.get(0)?,row.get(1)?))
-        )?;
-        Ok((terminal!=0,notified!=0))
-    }
-    /// Host restart: locate *only* the active queued reviewed-app display
-    /// placeholders without loading the whole conversation into memory.
-    /// This is a read-only navigation index, never a new authority grant.
-    pub fn pending_reviewed_queue_turns(
-        &self,session_id:&str,exact_host_marker:&str,limit:usize
-    )->Result<Vec<String>,AnsfError>{
-        if !valid_session(session_id)||exact_host_marker.is_empty()
-            ||exact_host_marker.len()>512||limit==0||limit>128{
-            return Err(AnsfError::InvalidInput)
-        }
-        let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
-        let mut statement=conn.prepare(
-            "SELECT d.generation_id FROM ansf_visible_chat d
-             JOIN ansf_live_chat_events e ON e.seq=d.latest_event_seq
-             WHERE d.session_id=?1 AND d.role='assistant'
-               AND d.status='interrupted' AND e.kind='assistant_progress'
-               AND e.text=?2 AND d.generation_id IS NOT NULL
-             ORDER BY d.first_seq ASC LIMIT ?3"
-        )?;
-        let rows=statement.query_map(
-            params![session_id,exact_host_marker,(limit+1) as i64],
-            |row|row.get::<_,String>(0)
-        )?;
-        let mut ids=Vec::new();
-        for row in rows{
-            let id=row?;
-            if !opaque(&id,"g-"){return Err(AnsfError::InvalidInput)}
-            ids.push(id);
-        }
-        if ids.len()>limit{return Err(AnsfError::InvalidInput)}
-        Ok(ids)
     }
     /// No legacy import, model output, Reader event or copied memory can pass
     /// as a current host-authenticated user turn.
@@ -556,9 +430,8 @@ impl AnsfStore{
             |r|Ok((r.get(0)?,r.get(1)?))
         ).optional().map_err(Into::into)
     }
-    /// UX-CHAT02: exact host-authenticated, immutable visible message
-    /// sequence associated with one original human turn. Never infer by
-    /// matching potentially duplicated prompt text or latest chat row.
+    /// Exact visible message sequence of one host-authenticated human turn.
+    /// Never inferred by matching duplicated prompt text or the latest row.
     pub fn authenticated_chat_turn_visible_seq(
         &self,session_id:&str,turn_id:&str
     )->Result<Option<(i64,String)>,AnsfError>{
@@ -577,13 +450,9 @@ impl AnsfStore{
             |r|Ok((r.get(0)?,r.get(1)?))
         ).optional().map_err(Into::into)
     }
-    /// Indexed latest human-origin authenticated user turn. No imported,
-    /// unauthenticated or Reader event ever appears in this result.
-    /// MEMORY-LOOP-02: select only earlier host-authenticated human turns
-    /// from the ORIGINAL ANSF conversation by indexed source event seq.
-    /// Imported user text, Reader turns and assistant text never participate.
-    /// A caller cannot scan or choose a different conversation with a file
-    /// path, and the current authenticated turn is strictly excluded.
+    /// Earlier host-authenticated human turns of this conversation, newest
+    /// first. Imported user text, Reader turns and assistant text never
+    /// participate, and the current turn itself is excluded.
     pub fn recent_authenticated_turns_before(
         &self,session_id:&str,current_turn:&str,limit:usize
     )->Result<Vec<String>,AnsfError>{
@@ -646,15 +515,11 @@ impl AnsfStore{
         }
         let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
         conn.query_row(
-            "SELECT e.id,e.session_id,e.chapter_id,e.message_id,e.role,e.summary,e.content
+            &format!("SELECT {ENTRY_COLUMNS_E}
              FROM ansf_live_chat_events le JOIN ansf_entries e
                ON le.source_entry_id=e.id
-             WHERE le.session_id=?1 AND le.event_id=?2 AND e.session_id=?1",
-            params![session_id,event_id],|r|Ok(Entry{
-                id:r.get(0)?,session_id:r.get(1)?,chapter_id:r.get(2)?,
-                message_id:r.get(3)?,role:r.get(4)?,summary:r.get(5)?,
-                content:r.get(6)?,
-            })
+             WHERE le.session_id=?1 AND le.event_id=?2 AND e.session_id=?1"),
+            params![session_id,event_id],AnsfStore::map_entry
         ).optional().map_err(Into::into)
     }
 }
@@ -668,7 +533,6 @@ mod tests{
             user_turn_id:turn.map(|v|format!("g-{v:032x}")),
             legacy_turn_id:None,
             generation_id:gen.map(|v|format!("g-{v:032x}")),
-            call_id:None,tool_id:None,
         }
     }
     fn path()->std::path::PathBuf{
@@ -710,6 +574,30 @@ mod tests{
             assert!(store.live_chat_events_after("c-live",0,101).is_err());
         }
         let _=fs::remove_file(db);
+    }
+    #[test]
+    fn stream_rejects_terminal_without_progress_and_progress_after_terminal(){
+        let store=AnsfStore::in_memory().unwrap();
+        store.create_session("c-s","workspace","Stream").unwrap();
+        store.start_chapter("c-s","Chapter").unwrap();
+        // No stream with generation 7 exists, so it cannot be completed or cancelled.
+        assert!(store.append_host_chat_event("c-s",
+            &event(1,LiveKind::AssistantCompleted,"",None,Some(7))).is_err());
+        assert!(store.append_host_chat_event("c-s",
+            &event(2,LiveKind::AssistantCancelled,"",None,Some(7))).is_err());
+        store.append_host_chat_event("c-s",
+            &event(3,LiveKind::AssistantProgress,"partial",None,Some(7))).unwrap();
+        store.append_host_chat_event("c-s",
+            &event(4,LiveKind::AssistantCancelled,"",None,Some(7))).unwrap();
+        // A finished stream takes no more text and cannot be re-finished.
+        assert!(store.append_host_chat_event("c-s",
+            &event(5,LiveKind::AssistantProgress,"late",None,Some(7))).is_err());
+        assert!(store.append_host_chat_event("c-s",
+            &event(6,LiveKind::AssistantCompleted,"",None,Some(7))).is_err());
+        let (page,_)=store.visible_chat_before("c-s",i64::MAX,10).unwrap();
+        assert_eq!(page.len(),1);
+        assert_eq!(page[0].text,"partial");
+        assert!(page[0].cancelled);
     }
     #[test]
     fn durable_visible_cursor_pages_collapse_stream_progress_and_recover_cancelled(){

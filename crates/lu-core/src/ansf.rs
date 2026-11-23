@@ -1,8 +1,5 @@
 //! ANSF (AI-Native Session Format): exact, indexed, disk-backed conversation history.
 //!
-//! This is an independent Lu Core storage slice, NOT yet connected to Jan's
-//! threads, prompt assembler, memory worker, or desktop renderer.
-//!
 //! Original messages are immutable. Summaries and chapters are navigation aids,
 //! never substitutes for source text, and are never authority to invoke tools.
 //! Callers must authenticate the conversation owner before reading or writing.
@@ -16,6 +13,11 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_SUMMARY_BYTES: usize = 2048;
 const MAX_ENTRY_BYTES: usize = 1024 * 1024;
 const MAX_PAGE: usize = 100;
+
+/// Column list matching `AnsfStore::map_entry`, unqualified and aliased `e.`.
+pub(crate) const ENTRY_COLUMNS: &str = "id,session_id,chapter_id,message_id,role,summary,content";
+pub(crate) const ENTRY_COLUMNS_E: &str =
+    "e.id,e.session_id,e.chapter_id,e.message_id,e.role,e.summary,e.content";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnsfError {
@@ -77,6 +79,20 @@ pub struct Chapter {
 
 pub struct AnsfStore {
     pub(crate) conn: Mutex<Connection>,
+}
+
+/// Treat a search query as literal words joined by AND. FTS5 operators,
+/// quotes, column filters and wildcards from the caller (user, model or
+/// recalled text) must not change the query, and must not make it a syntax error.
+pub(crate) fn literal_fts_query(value: &str) -> Result<String, AnsfError> {
+    if value.trim().is_empty() || value.len() > 256 || value.contains(char::from(0)) {
+        return Err(AnsfError::InvalidInput);
+    }
+    Ok(value
+        .split_whitespace()
+        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND "))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -177,7 +193,6 @@ impl AnsfStore {
                SELECT RAISE(ABORT,'ANSF source entries are immutable');
              END;",
         )?;
-        crate::ansf_goals::initialize_goal_schema(&conn)?;
         crate::ansf_artifact_links::initialize_artifact_schema(&conn)?;
         crate::ansf_live_chat::initialize_live_chat_schema(&conn)?;
         crate::ansf_goal_records::initialize_goal_record_schema(&conn)?;
@@ -353,7 +368,7 @@ impl AnsfStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
+    pub(crate) fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         Ok(Entry {
             id: r.get(0)?,
             session_id: r.get(1)?,
@@ -379,8 +394,7 @@ impl AnsfStore {
         }
         let conn = self.conn.lock().map_err(|_| AnsfError::Locked)?;
         conn.query_row(
-            "SELECT id,session_id,chapter_id,message_id,role,summary,content
-             FROM ansf_entries WHERE session_id=?1 AND message_id=?2",
+            &format!("SELECT {ENTRY_COLUMNS} FROM ansf_entries WHERE session_id=?1 AND message_id=?2"),
             params![session_id, message_id],
             Self::map_entry,
         )
@@ -394,8 +408,7 @@ impl AnsfStore {
         }
         let conn = self.conn.lock().map_err(|_| AnsfError::Locked)?;
         conn.query_row(
-            "SELECT id,session_id,chapter_id,message_id,role,summary,content
-             FROM ansf_entries WHERE session_id=?1 AND id=?2",
+            &format!("SELECT {ENTRY_COLUMNS} FROM ansf_entries WHERE session_id=?1 AND id=?2"),
             params![session_id, entry_id],
             Self::map_entry,
         )
@@ -530,6 +543,7 @@ impl AnsfStore {
         {
             return Err(AnsfError::InvalidInput);
         }
+        let query = literal_fts_query(query)?;
         let conn = self.conn.lock().map_err(|_| AnsfError::Locked)?;
         let mut stmt = conn.prepare(
             "SELECT e.id,e.session_id,e.chapter_id,e.message_id,e.role,e.summary,e.content
@@ -574,6 +588,7 @@ impl AnsfStore {
         {
             return Err(AnsfError::InvalidInput);
         }
+        let query = literal_fts_query(query)?;
         let conn = self.conn.lock().map_err(|_| AnsfError::Locked)?;
         let mut stmt = conn.prepare(
             "SELECT e.id,e.session_id,e.chapter_id,e.message_id,e.role,e.summary,e.content

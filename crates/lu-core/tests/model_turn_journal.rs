@@ -1,6 +1,6 @@
 use lu_core::{
-    model_json_boundary::{JsonRepairStatus, MAX_BOUNDARY_JSON_BYTES},
-    model_turn_journal::{ModelAuditError, ModelAuditKind, ModelTurnJournal},
+    model_json_boundary::JsonRepairStatus,
+    model_turn_journal::{ModelAuditError, ModelAuditKind, ModelTurnJournal, MAX_AUDIT_PAYLOAD_BYTES},
 };
 use std::{
     fs,
@@ -84,7 +84,7 @@ fn model_boundary_evidence_survives_reopen_and_remains_scoped() {
                 "conversation-a",
                 "task-1",
                 ModelAuditKind::ModelOutput,
-                &"x".repeat(MAX_BOUNDARY_JSON_BYTES + 1),
+                &"x".repeat(MAX_AUDIT_PAYLOAD_BYTES + 1),
                 None
             ),
             Err(ModelAuditError::OversizedEvent)

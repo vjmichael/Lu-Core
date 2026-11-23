@@ -6,8 +6,12 @@
 
 use std::{path::Path, sync::Mutex};
 
-use crate::model_json_boundary::{JsonRepairStatus, MAX_BOUNDARY_JSON_BYTES};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use crate::model_json_boundary::JsonRepairStatus;
+use rusqlite::{params, Connection};
+
+/// Largest audited payload. Model output is recorded whole, so this matches
+/// the chat event limit rather than the 64 KiB tool-call JSON limit.
+pub const MAX_AUDIT_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelAuditKind {
@@ -95,11 +99,12 @@ pub struct ModelTurnJournal {
 }
 
 impl ModelTurnJournal {
-    /// The SQLite CHECK constraint is part of the stored table schema, so a
-    /// new audit kind requires a transactional table migration for old profiles.
-    /// Keep sequence IDs and existing rows intact. A failed copy rolls back.
-    fn install_schema(connection: &mut Connection) -> Result<(), ModelAuditError> {
-        const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS lu_model_boundary_audit (
+    pub fn open(path: &Path) -> Result<Self, ModelAuditError> {
+        let connection = Connection::open(path)?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS lu_model_boundary_audit (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT NOT NULL,
                 task_id TEXT NOT NULL,
@@ -109,54 +114,10 @@ impl ModelTurnJournal {
                 payload TEXT NOT NULL,
                 repair TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-             );";
-        const CREATE_INDEX: &str = "CREATE INDEX IF NOT EXISTS lu_model_boundary_by_task
-            ON lu_model_boundary_audit(conversation_id, task_id, sequence);";
-        let previous: Option<String> = connection.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='lu_model_boundary_audit'",
-            [], |row| row.get(0),
-        ).optional()?;
-        match previous {
-            None => {
-                connection.execute_batch(CREATE_TABLE)?;
-                connection.execute_batch(CREATE_INDEX)?;
-            }
-            Some(schema) if schema.contains("'HOST_ROUTE_SELECTED'") => {
-                connection.execute_batch(CREATE_INDEX)?;
-            }
-            Some(_) => {
-                // No ALTER CHECK support in SQLite. This is an atomic rebuild
-                // of this audit table ONLY, preserving the original sequence.
-                let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                tx.execute_batch("CREATE TABLE lu_model_boundary_audit_migrating (
-                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                        conversation_id TEXT NOT NULL,
-                        task_id TEXT NOT NULL,
-                        kind TEXT NOT NULL CHECK(kind IN (
-                            'USER_REQUEST','MODEL_OUTPUT','PARSED_CANDIDATE','HOST_ROUTE_SELECTED',
-                            'REJECTED','TOOL_FEEDBACK','FINAL_ANSWER','GENERATION_FAILURE')),
-                        payload TEXT NOT NULL,
-                        repair TEXT,
-                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    );
-                    INSERT INTO lu_model_boundary_audit_migrating
-                        (sequence,conversation_id,task_id,kind,payload,repair,created_at)
-                    SELECT sequence,conversation_id,task_id,kind,payload,repair,created_at
-                      FROM lu_model_boundary_audit;
-                    DROP TABLE lu_model_boundary_audit;
-                    ALTER TABLE lu_model_boundary_audit_migrating RENAME TO lu_model_boundary_audit;")?;
-                tx.execute_batch(CREATE_INDEX)?;
-                tx.commit()?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn open(path: &Path) -> Result<Self, ModelAuditError> {
-        let mut connection = Connection::open(path)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
-        Self::install_schema(&mut connection)?;
+             );
+             CREATE INDEX IF NOT EXISTS lu_model_boundary_by_task
+               ON lu_model_boundary_audit(conversation_id, task_id, sequence);",
+        )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -184,7 +145,7 @@ impl ModelTurnJournal {
         repair: Option<JsonRepairStatus>,
     ) -> Result<i64, ModelAuditError> {
         Self::validate_origin(conversation_id, task_id)?;
-        if payload.len() > MAX_BOUNDARY_JSON_BYTES {
+        if payload.len() > MAX_AUDIT_PAYLOAD_BYTES {
             return Err(ModelAuditError::OversizedEvent);
         }
         let repair = repair.map(|status| format!("{status:?}"));
@@ -306,7 +267,7 @@ impl ModelTurnJournal {
         let mut events=Vec::new();
         for row in rows{
             let (sequence,kind,payload,repair)=row?;
-            if events.len()>=max_events || payload.len()>MAX_BOUNDARY_JSON_BYTES {
+            if events.len()>=max_events || payload.len()>MAX_AUDIT_PAYLOAD_BYTES {
                 return Err(ModelAuditError::OversizedEvent)
             }
             events.push(ModelAuditRecord{

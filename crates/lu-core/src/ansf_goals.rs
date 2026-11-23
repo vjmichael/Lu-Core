@@ -1,21 +1,16 @@
-//! M2: durable, human-origin goal and clarification events in an ANSF book.
-//! This is task *context*, never execution authority. The live desktop
-//! ChatStore event is the source. This SQLite table is its idempotent,
- //! source-checked ANSF projection, not a competing human-turn journal.
-use crate::ansf::{AnsfError,AnsfStore};
-use rusqlite::{params,Connection,OptionalExtension};
-use serde::{Serialize,Deserialize};
-use sha2::{Digest,Sha256};
+//! Goal and clarification events: validation and projection into the
+//! current goal state. Storage lives in `ansf_goal_records`. This is task
+//! *context*, never execution authority.
+use crate::ansf::AnsfError;
+
 
 const MAX_EVENTS:usize=1024;
 const MAX_QUESTIONS:usize=64;
 
-#[derive(Clone,Copy,Debug,PartialEq,Eq,Serialize,Deserialize)]
-#[serde(rename_all="snake_case")]
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum GoalEventKind { SetGoal, AskQuestion, RespondQuestion }
 
-#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone,Debug,PartialEq,Eq)]
 pub struct GoalEvent {
     pub event_id:String,
     pub goal_id:String,
@@ -25,8 +20,7 @@ pub struct GoalEvent {
     pub choice:Option<String>,
     pub comment:Option<String>,
 }
-#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
-#[serde(rename_all="camelCase")]
+#[derive(Clone,Debug,PartialEq,Eq)]
 pub struct Clarification {
     pub question_id:String,
     pub question:String,
@@ -36,8 +30,7 @@ pub struct Clarification {
     pub opened_event_id:String,
     pub last_event_id:String,
 }
-#[derive(Clone,Debug,Default,PartialEq,Eq,Serialize,Deserialize)]
-#[serde(rename_all="camelCase")]
+#[derive(Clone,Debug,Default,PartialEq,Eq)]
 pub struct GoalSnapshot {
     pub goal_id:Option<String>,
     pub goal:String,
@@ -144,94 +137,6 @@ pub fn project_goal_events(events:&[GoalEvent])->Result<GoalSnapshot,AnsfError>{
     }
     Ok(context)
 }
-pub(crate) fn initialize_goal_schema(conn:&Connection)->Result<(),AnsfError>{
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ansf_goal_events (
-            seq INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL REFERENCES ansf_sessions(id),
-            event_id TEXT NOT NULL UNIQUE,
-            source_kind TEXT NOT NULL CHECK(source_kind='desktop_chat_journal'),
-            event_json TEXT NOT NULL,
-            source_sha256 TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE INDEX IF NOT EXISTS ansf_goal_events_session_seq
-            ON ansf_goal_events(session_id,seq);"
-    )?;
-    Ok(())
-}
-fn sha(data:&str)->String{format!("{:x}",Sha256::digest(data.as_bytes()))}
-impl AnsfStore {
-    /// Replay exactly one stable source event. A partial JSONL -> ANSF sync
-    /// is repaired by replay after restart; a conflicting duplicate fails.
-    pub fn mirror_goal_event(&self,session_id:&str,event:&GoalEvent)->Result<(),AnsfError>{
-        event.validate()?;
-        if session_id.is_empty()||session_id.len()>128||session_id.contains('\0'){
-            return Err(AnsfError::InvalidInput)
-        }
-        let json=serde_json::to_string(event).map_err(|_|AnsfError::InvalidInput)?;
-        let digest=sha(&json);
-        let mut conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
-        let tx=conn.transaction()?;
-        let prior:Option<(String,String)>=tx.query_row(
-            "SELECT session_id,source_sha256 FROM ansf_goal_events WHERE event_id=?1",
-            [&event.event_id],
-            |r|Ok((r.get(0)?,r.get(1)?)),
-        ).optional()?;
-        if let Some((original_session,original_digest))=prior {
-            if original_session==session_id && original_digest==digest {
-                return Ok(());
-            }
-            return Err(AnsfError::InvalidInput)
-        }
-        let mut events=Vec::new();
-        {
-            let mut stmt=tx.prepare(
-                "SELECT event_json,source_sha256 FROM ansf_goal_events
-                 WHERE session_id=?1 ORDER BY seq"
-            )?;
-            let iter=stmt.query_map([session_id],|r|
-                Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
-            for row in iter{
-                let (stored,digest)=row?;
-                if sha(&stored)!=digest{return Err(AnsfError::InvalidInput);}
-                events.push(serde_json::from_str::<GoalEvent>(&stored)
-                    .map_err(|_|AnsfError::InvalidInput)?);
-            }
-        }
-        events.push(event.clone());
-        project_goal_events(&events)?;
-        tx.execute(
-            "INSERT INTO ansf_goal_events
-             (session_id,event_id,source_kind,event_json,source_sha256)
-             VALUES (?1,?2,'desktop_chat_journal',?3,?4)",
-            params![session_id,event.event_id,json,digest],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-    pub fn goal_events(&self,session_id:&str)->Result<Vec<GoalEvent>,AnsfError>{
-        if session_id.is_empty()||session_id.len()>128||session_id.contains('\0'){
-            return Err(AnsfError::InvalidInput)
-        }
-        let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
-        let mut stmt=conn.prepare(
-            "SELECT event_json,source_sha256 FROM ansf_goal_events
-             WHERE session_id=?1 AND source_kind='desktop_chat_journal' ORDER BY seq"
-        )?;
-        let rows=stmt.query_map([session_id],|r|
-            Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?;
-        let mut result=Vec::new();
-        for row in rows{
-            let (value,digest)=row?;
-            if sha(&value)!=digest{return Err(AnsfError::InvalidInput);}
-            result.push(serde_json::from_str::<GoalEvent>(&value)
-                .map_err(|_|AnsfError::InvalidInput)?);
-        }
-        project_goal_events(&result)?;
-        Ok(result)
-    }
-}
 #[cfg(test)]
 mod tests{
     use super::*;
@@ -258,17 +163,5 @@ mod tests{
         let revised=event(6,GoalEventKind::SetGoal,None,"Create a feature film",None);
         illegal=records[..3].to_vec(); illegal.push(revised);
         assert_eq!(project_goal_events(&illegal).unwrap().questions[0].status,"superseded");
-    }
-    #[test]
-    fn duplicate_conflict_and_crash_replay_are_safe(){
-        let store=AnsfStore::in_memory().unwrap();
-        store.ensure_session("c-1","local-owner","Test").unwrap();
-        let first=event(1,GoalEventKind::SetGoal,None,"Start the project",None);
-        store.mirror_goal_event("c-1",&first).unwrap();
-        store.mirror_goal_event("c-1",&first).unwrap();
-        assert_eq!(store.goal_events("c-1").unwrap().len(),1);
-        let mut changed=first.clone();changed.text="injected replacement".into();
-        assert!(store.mirror_goal_event("c-1",&changed).is_err());
-        assert!(store.mirror_goal_event("c-2",&first).is_err());
     }
 }

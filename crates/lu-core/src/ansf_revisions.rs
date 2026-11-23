@@ -13,7 +13,7 @@
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::ansf::{AnsfError, AnsfStore, Entry};
+use crate::ansf::{AnsfError, AnsfStore, Entry, ENTRY_COLUMNS};
 
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_SUMMARY_BYTES: usize = 2048;
@@ -99,11 +99,9 @@ impl AnsfStore {
             }));
         };
         let entry = conn.query_row(
-            "SELECT id,session_id,chapter_id,message_id,role,summary,content
-             FROM ansf_entries
-             WHERE session_id=?1 AND id=?2",
+            &format!("SELECT {ENTRY_COLUMNS} FROM ansf_entries WHERE session_id=?1 AND id=?2"),
             params![session_id, link.revised_entry_id],
-            map_entry,
+            AnsfStore::map_entry,
         )?;
         Ok(Some(CurrentMessage {
             entry,
@@ -234,18 +232,6 @@ impl AnsfStore {
         let rows = stmt.query_map(params![session_id, original.id], map_link)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
-}
-
-fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
-    Ok(Entry {
-        id: r.get(0)?,
-        session_id: r.get(1)?,
-        chapter_id: r.get(2)?,
-        message_id: r.get(3)?,
-        role: r.get(4)?,
-        summary: r.get(5)?,
-        content: r.get(6)?,
-    })
 }
 
 fn map_link(r: &rusqlite::Row<'_>) -> rusqlite::Result<RevisionLink> {

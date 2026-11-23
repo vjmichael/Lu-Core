@@ -5,7 +5,7 @@
 //!
 //! Exact cosine scan is intentionally bounded: an optional, reviewed nearest-
 //! neighbor extension can accelerate search later without changing source IDs.
-use crate::ansf::{AnsfError,AnsfStore,Entry};
+use crate::ansf::{AnsfError,AnsfStore,Entry,ENTRY_COLUMNS_E};
 use crate::ansf_source_ids::AnsfSourceId;
 use rusqlite::{params,Connection};
 use sha2::{Digest,Sha256};
@@ -87,8 +87,8 @@ impl AnsfStore{
            session_id.contains('\0')||!valid_model(embedding_model)||
            limit==0||limit>24{return Err(AnsfError::InvalidInput)}
         let conn=self.conn.lock().map_err(|_|AnsfError::Locked)?;
-        let mut stmt=conn.prepare(
-            "SELECT e.id,e.session_id,e.chapter_id,e.message_id,e.role,e.summary,e.content
+        let mut stmt=conn.prepare(&format!(
+            "SELECT {ENTRY_COLUMNS_E}
              FROM ansf_entries e
              WHERE e.session_id=?1 AND e.role IN ('user','assistant')
                AND length(trim(e.content))>0
@@ -97,14 +97,9 @@ impl AnsfStore{
                 WHERE s.entry_id=e.id AND s.embedding_model=?2 AND s.chunk_ordinal=0
                )
              ORDER BY e.id ASC LIMIT ?3"
-        )?;
-        let entries=stmt.query_map(params![session_id,embedding_model,limit as i64],|r|{
-            Ok(Entry{
-                id:r.get(0)?,session_id:r.get(1)?,chapter_id:r.get(2)?,
-                message_id:r.get(3)?,role:r.get(4)?,summary:r.get(5)?,
-                content:r.get(6)?
-            })
-        })?.collect::<Result<Vec<_>,_>>()?;
+        ))?;
+        let entries=stmt.query_map(params![session_id,embedding_model,limit as i64],
+            AnsfStore::map_entry)?.collect::<Result<Vec<_>,_>>()?;
         Ok(entries)
     }
     pub fn semantic_indexed_count(

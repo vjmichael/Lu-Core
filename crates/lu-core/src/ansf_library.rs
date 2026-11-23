@@ -98,18 +98,8 @@ fn valid_entry_span(start: Option<i64>, end: Option<i64>) -> bool {
     }
 }
 
-/// Treat the user query as literal words. Do not allow externally supplied
-/// FTS5 operators, quote syntax, columns or wildcards to change its meaning.
-/// Bound SQL parameters independently prevent SQL injection.
 fn literal_fts_query(value: &str) -> Result<String, LibraryError> {
-    if value.trim().is_empty() || value.len() > 256 || value.contains('\0') {
-        return Err(LibraryError::InvalidInput);
-    }
-    Ok(value
-        .split_whitespace()
-        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" AND "))
+    crate::ansf::literal_fts_query(value).map_err(|_| LibraryError::InvalidInput)
 }
 
 impl AnsfLibrary {
