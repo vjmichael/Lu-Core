@@ -4,6 +4,7 @@ use lu_core::{
     ansf_operations::OperationKind,
     files::{Call, Content, FileAccess, FileError, ReadResult, WorkingScope, WriteMode, WriteRequest},
     journal::{EffectJournal, EffectState},
+    origin::OriginGate,
     recorder::Recorder,
     snapshot::{SnapshotLimits, SnapshotStore},
 };
@@ -20,6 +21,7 @@ struct Env {
     book: AnsfStore,
     journal: EffectJournal,
     snapshots: SnapshotStore,
+    gate: OriginGate,
 }
 static CALLS: AtomicU32 = AtomicU32::new(0);
 fn call() -> Call {
@@ -51,7 +53,8 @@ fn env(name: &str) -> Env {
     .unwrap();
     let journal = EffectJournal::open(&base.join("effects.sqlite")).unwrap();
     let snapshots = SnapshotStore::open(&base.join("lu-data")).unwrap();
-    Env { base, project, book, journal, snapshots }
+    let gate = OriginGate::open(&base.join("origin.sqlite")).unwrap();
+    Env { base, project, book, journal, snapshots, gate }
 }
 fn dunce(p: PathBuf) -> PathBuf {
     let t = p.to_string_lossy().to_string();
@@ -63,6 +66,7 @@ macro_rules! files {
         let $fa = FileAccess::new(
             &$rec,
             &$env.snapshots,
+            &$env.gate,
             WorkingScope::new(std::slice::from_ref(&$env.project)).unwrap(),
             SnapshotLimits::default(),
         );

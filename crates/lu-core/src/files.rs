@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ansf_operations::{CommandFinish, CommandStart, FileChange};
 use crate::recorder::{RecordError, Recorder};
+use crate::origin::{path_text, Decision, EffectKind, OriginError, OriginGate, Proposal};
 use crate::snapshot::{SnapshotError, SnapshotLimits, SnapshotStore, TrashEntry};
 
 /// Largest content accepted in one write.
@@ -103,8 +104,12 @@ pub struct DirEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileError {
-    /// Outside the working scope: not done; the user is told what was asked.
-    Held { path: PathBuf, reason: String },
+    /// Not done. Outside the working scope, or traced to untrusted content
+    /// (then `held_id` names the held action and `notify_user` is true the
+    /// first time that content caused a hold).
+    Held { path: PathBuf, reason: String, held_id: Option<i64>, notify_user: bool },
+    /// Never done: a send traced to untrusted content.
+    Refused { reason: String },
     NotFound,
     AlreadyExists,
     /// The file changed since the model read it.
@@ -117,6 +122,12 @@ pub enum FileError {
     Io(String),
     Snapshot(SnapshotError),
     Record(RecordError),
+    Origin(OriginError),
+}
+impl From<OriginError> for FileError {
+    fn from(e: OriginError) -> Self {
+        Self::Origin(e)
+    }
 }
 impl From<std::io::Error> for FileError {
     fn from(e: std::io::Error) -> Self {
@@ -303,6 +314,7 @@ fn unique_suffix() -> String {
 pub struct FileAccess<'a> {
     recorder: &'a Recorder<'a>,
     snapshots: &'a SnapshotStore,
+    gate: &'a OriginGate,
     scope: WorkingScope,
     limits: SnapshotLimits,
 }
@@ -311,10 +323,51 @@ impl<'a> FileAccess<'a> {
     pub fn new(
         recorder: &'a Recorder<'a>,
         snapshots: &'a SnapshotStore,
+        gate: &'a OriginGate,
         scope: WorkingScope,
         limits: SnapshotLimits,
     ) -> Self {
-        Self { recorder, snapshots, scope, limits }
+        Self { recorder, snapshots, gate, scope, limits }
+    }
+
+    /// Ask the origin gate whether this action runs.
+    fn allowed(&self, call: &Call, effect: EffectKind, what: &str, path: &Path) -> Result<(), FileError> {
+        let proposal = Proposal {
+            session_id: self.recorder.session_id().to_owned(),
+            turn_id: call.turn_id.clone(),
+            call_id: call.call_id.clone(),
+            effect,
+            text: path_text(what, path),
+        };
+        match self.gate.decide(self.recorder.book(), &proposal)? {
+            Decision::Run => Ok(()),
+            Decision::Hold { held_id, source, notify } => Err(FileError::Held {
+                path: path.to_path_buf(),
+                reason: format!("asked for by untrusted content: {:?} {}", source.kind, source.reference),
+                held_id: Some(held_id),
+                notify_user: notify,
+            }),
+            Decision::Refuse { source } => Err(FileError::Refused {
+                reason: format!("a send asked for by untrusted content: {:?} {}", source.kind, source.reference),
+            }),
+        }
+    }
+
+    fn instruction(&self, call: &Call) -> Result<String, FileError> {
+        Ok(self
+            .recorder
+            .book()
+            .authenticated_chat_turn(self.recorder.session_id(), &call.turn_id)
+            .map_err(|e| FileError::Origin(OriginError::Ansf(e)))?
+            .map(|(text, _)| text)
+            .unwrap_or_default())
+    }
+
+    /// A writable target: inside the working scope and allowed by the gate.
+    fn writable_for(&self, call: &Call, effect: EffectKind, what: &str, path: &Path) -> Result<PathBuf, FileError> {
+        let target = self.writable(path)?;
+        self.allowed(call, effect, what, &target)?;
+        Ok(target)
     }
 
     fn writable(&self, path: &Path) -> Result<PathBuf, FileError> {
@@ -323,6 +376,8 @@ impl<'a> FileAccess<'a> {
             return Err(FileError::Held {
                 path: target,
                 reason: "outside the working scope; the user's instruction did not name it".into(),
+                held_id: None,
+                notify_user: true,
             });
         }
         Ok(target)
@@ -388,6 +443,11 @@ impl<'a> FileAccess<'a> {
                 }
                 let bytes = fs::read(&target)?;
                 if let Ok(content) = String::from_utf8(bytes) {
+                    // An outside file's text is untrusted content: actions
+                    // copied from it will be traced back to it.
+                    if let Some(source) = self.gate.external_file(&target)? {
+                        self.gate.register_content(self.recorder.session_id(), &source, &content)?;
+                    }
                     let digest = sha(content.as_bytes());
                     let summary = format!("text {size} bytes sha256={digest}");
                     let lines = lines(&content).len();
@@ -430,7 +490,7 @@ impl<'a> FileAccess<'a> {
 
     /// Write content to a path through a staged, checked, atomic swap.
     pub fn write(&self, call: &Call, request: &WriteRequest) -> Result<WriteReceipt, FileError> {
-        let target = self.writable(&request.path)?;
+        let target = self.writable_for(call, EffectKind::Write, "lu.files.write", &request.path)?;
         let bytes = decode(&request.content)?;
         self.recorded(call, "lu.files.write", &target, || {
             let exists = target.is_file();
@@ -454,6 +514,11 @@ impl<'a> FileAccess<'a> {
                 check_intended_lines(old, &bytes, first, last).map_err(FileError::CheckFailed)?;
             }
             let receipt = self.stage_and_swap(call, &target, &bytes, before)?;
+            // Origin travels with content: text copied from untrusted
+            // content marks the written file as external.
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                self.gate.propagate_to_written_file(self.recorder.session_id(), &self.instruction(call)?, &target, text)?;
+            }
             let summary = format!("wrote {} bytes sha256={}", receipt.size, receipt.sha256);
             Ok((receipt, summary))
         })
@@ -470,7 +535,7 @@ impl<'a> FileAccess<'a> {
         replacement: &str,
         expected_sha256: Option<String>,
     ) -> Result<WriteReceipt, FileError> {
-        let target = self.writable(path)?;
+        let target = self.writable_for(call, EffectKind::Write, "lu.files.write", path)?;
         let old = fs::read_to_string(&target).map_err(|_| FileError::Invalid("not a readable text file".into()))?;
         let o = lines(&old);
         if first == 0 || last < first || last > o.len() {
@@ -543,7 +608,7 @@ impl<'a> FileAccess<'a> {
     /// Copy a file. The copy is staged and checked against the source hash.
     pub fn copy(&self, call: &Call, from: &Path, to: &Path, overwrite: bool) -> Result<WriteReceipt, FileError> {
         let source = resolve(from)?;
-        let target = self.writable(to)?;
+        let target = self.writable_for(call, EffectKind::Write, "lu.files.copy", to)?;
         self.recorded(call, "lu.files.copy", &target, || {
             if target.exists() && !overwrite {
                 return Err(FileError::AlreadyExists);
@@ -558,8 +623,8 @@ impl<'a> FileAccess<'a> {
 
     /// Move a file within the working scope. Never overwrites.
     pub fn move_file(&self, call: &Call, from: &Path, to: &Path) -> Result<PathBuf, FileError> {
-        let source = self.writable(from)?;
-        let target = self.writable(to)?;
+        let source = self.writable_for(call, EffectKind::Write, "lu.files.move", from)?;
+        let target = self.writable_for(call, EffectKind::Write, "lu.files.move", to)?;
         self.recorded(call, "lu.files.move", &source, || {
             if target.exists() {
                 return Err(FileError::AlreadyExists);
@@ -588,7 +653,7 @@ impl<'a> FileAccess<'a> {
 
     /// Delete a file by moving it to Lu's recoverable trash.
     pub fn trash(&self, call: &Call, path: &Path) -> Result<TrashEntry, FileError> {
-        let target = self.writable(path)?;
+        let target = self.writable_for(call, EffectKind::Delete, "lu.files.trash", path)?;
         self.recorded(call, "lu.files.trash", &target, || {
             let entry = self.snapshots.trash(&target)?;
             self.changed(call, &target, Some(entry.sha256.clone()), None, Some(format!("trash:{}", entry.id)))?;
@@ -599,7 +664,7 @@ impl<'a> FileAccess<'a> {
 
     /// Put a trashed file back. Refused if its old path is taken.
     pub fn restore_from_trash(&self, call: &Call, entry: &TrashEntry) -> Result<PathBuf, FileError> {
-        self.writable(&entry.original_path)?;
+        self.writable_for(call, EffectKind::Write, "lu.files.restore_trash", &entry.original_path)?;
         self.recorded(call, "lu.files.restore_trash", &entry.original_path, || {
             let path = self.snapshots.restore_trashed(entry.id)?;
             self.changed(call, &path, None, Some(entry.sha256.clone()), Some(format!("trash:{}", entry.id)))?;

@@ -17,3 +17,4 @@ pub mod model_json_boundary;
 pub mod recorder;
 pub mod snapshot;
 pub mod files;
+pub mod origin;

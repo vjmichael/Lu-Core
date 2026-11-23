@@ -61,6 +61,8 @@ impl<'a> Recorder<'a>{
     pub fn new(book:&'a AnsfStore,journal:&'a EffectJournal,session_id:impl Into<String>)->Self{
         Self{book,journal,session_id:session_id.into()}
     }
+    pub fn session_id(&self)->&str{&self.session_id}
+    pub fn book(&self)->&'a AnsfStore{self.book}
 
     /// Record a command before it runs. Returns only when both stores have
     /// it, so the caller may then spawn the process.
