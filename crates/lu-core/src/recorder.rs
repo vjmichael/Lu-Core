@@ -22,6 +22,7 @@ use crate::ansf_goals::GoalSnapshot;
 use crate::ansf_operations::{CommandFinish,CommandStart,FileChange,OperationRecord};
 use crate::contracts::{ProtoPayload,ToolInvocation};
 use crate::journal::{EffectJournal,JournalError,PrepareOutcome};
+use crate::snapshot::{Change,SnapshotInfo};
 
 /// Tool ID under which every recorded command is journaled.
 pub const COMMAND_TOOL_ID:&str="lu.command";
@@ -90,6 +91,27 @@ impl<'a> Recorder<'a>{
     /// Record one file the running command changed.
     pub fn file_changed(&self,change:&FileChange)->Result<(),RecordError>{
         self.book.record_file_change(&self.session_id,change)?;
+        Ok(())
+    }
+
+    /// Record every change found by comparing the scope before and after a
+    /// command, each pointing to the snapshot that holds the original.
+    pub fn record_changes(&self,call_id:&str,snapshot:&SnapshotInfo,changes:&[Change])
+        ->Result<(),RecordError>{
+        for change in changes{
+            let (before,after)=match change{
+                Change::Added{after,..}=>(None,Some(after)),
+                Change::Removed{before,..}=>(Some(before),None),
+                Change::Modified{before,after,..}=>(Some(before),Some(after)),
+            };
+            self.file_changed(&FileChange{
+                call_id:call_id.into(),
+                path:snapshot.scope.join(change.path()).to_string_lossy().into_owned(),
+                sha256_before:before.map(|s|s.sha256.clone()),
+                sha256_after:after.map(|s|s.sha256.clone()),
+                snapshot_ref:Some(snapshot.reference()),
+            })?;
+        }
         Ok(())
     }
 

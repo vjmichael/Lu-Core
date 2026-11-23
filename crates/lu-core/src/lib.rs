@@ -15,3 +15,4 @@ pub mod contracts;
 pub mod model_turn_journal;
 pub mod model_json_boundary;
 pub mod recorder;
+pub mod snapshot;
