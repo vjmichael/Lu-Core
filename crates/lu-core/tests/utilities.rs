@@ -178,3 +178,30 @@ fn a_helper_is_shown_only_to_a_model_that_needs_the_help() {
     let chat = TaskSignals { user_text: "How are you?".into(), files: vec![] };
     assert!(disclose(&catalog, &chat, &profile, &small).unwrap().is_empty());
 }
+
+#[test]
+fn the_real_starter_set_keeps_a_proven_model_on_the_minimal_surface() {
+    let dir = base("starter");
+    let profile = ProfileStore::open(&dir.join("profile.sqlite")).unwrap();
+    let journal = EffectJournal::open(&dir.join("effects.sqlite")).unwrap();
+    let proven = ModelRef::new("qwen3.8-27b", "Q4_K_M");
+    let fresh = ModelRef::new("flint", "Q4_K_M");
+    profile.register_model(&proven, false).unwrap();
+    profile.register_model(&fresh, false).unwrap();
+    for _ in 0..4 {
+        let id = format!("ok-{}", N.fetch_add(1, Ordering::SeqCst));
+        journal.prepare(&ToolInvocation { call_id: id.clone(), tool_id: "run".into(), workspace_id: None, input: ProtoPayload { type_url: "t".into(), bytes: id.clone().into_bytes() } }).unwrap();
+        journal.mark_executing(&id).unwrap();
+        journal.mark_applied(&id, b"").unwrap();
+        profile.record_outcome(&proven, TaskKind::FileWork, Augmentation::None, &id, &journal).unwrap();
+    }
+    let ids = |m: &ModelRef, text: &str| -> Vec<&'static str> {
+        let task = TaskSignals { user_text: text.into(), files: vec![] };
+        disclose(STARTER, &task, &profile, m).unwrap().into_iter().map(|d| d.spec.id).collect()
+    };
+    assert!(ids(&proven, "Make a Word document with the release notes").is_empty());
+    assert_eq!(ids(&fresh, "Make a Word document with the release notes"), ["lu_create_word_document"]);
+    assert_eq!(ids(&fresh, "Put the budget in a spreadsheet"), ["lu_create_spreadsheet"]);
+    assert_eq!(ids(&fresh, "Build a slide deck for Friday"), ["lu_create_presentation"]);
+    assert!(ids(&fresh, "What time is it?").is_empty());
+}

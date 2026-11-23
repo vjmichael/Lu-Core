@@ -58,7 +58,8 @@ pub const DOCUMENT_EXTENSIONS: &[&str] =
 
 /// The starter set built so far. Each entry is implemented and tested; a
 /// utility is added here only when it is.
-pub const STARTER: &[UtilitySpec] = &[UtilitySpec {
+pub const STARTER: &[UtilitySpec] = &[
+UtilitySpec {
     id: "lu_read_document",
     description: "Read one page, sheet, slide (or its speaker notes) or chapter of a document \
                   (PDF, Word, Excel, PowerPoint, OpenDocument, EPUB, RTF). The plain file read \
@@ -68,9 +69,36 @@ pub const STARTER: &[UtilitySpec] = &[UtilitySpec {
     kind: TaskKind::FileWork,
     trigger: Trigger {
         extensions: DOCUMENT_EXTENSIONS,
-        phrases: &["pdf", "word document", "spreadsheet", "excel", "powerpoint", "slide", "slides", "epub", "page"],
+        // Creating a file does not call for reading one: only words about
+        // reading parts of a document, and document files, trigger this.
+        phrases: &["pdf", "epub", "page", "chapter", "speaker notes"],
     },
-}];
+},
+UtilitySpec {
+    id: "lu_create_word_document",
+    description: "Create a Word document (.docx) from headings, paragraphs, bullets, tables and page breaks.                   Lu checks the file opens and holds every block before and after writing it.",
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"ends in .docx"},"replace":{"type":"boolean"},"title":{"type":"string"},"blocks":{"type":"array","minItems":1,"items":{"oneOf":[{"type":"object","properties":{"type":{"const":"heading"},"level":{"type":"integer","minimum":1,"maximum":3},"text":{"type":"string"}},"required":["type","level","text"],"additionalProperties":false},{"type":"object","properties":{"type":{"enum":["paragraph","bullet"]},"text":{"type":"string"}},"required":["type","text"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"table"},"rows":{"type":"array","items":{"type":"array","items":{"type":"string"}}}},"required":["type","rows"],"additionalProperties":false},{"type":"object","properties":{"type":{"const":"page_break"}},"required":["type"],"additionalProperties":false}]}}},"required":["path","blocks"],"additionalProperties":false}"#,
+    need: Need::Helper,
+    kind: TaskKind::FileWork,
+    trigger: Trigger { extensions: &["docx"], phrases: &["word document", "word doc", "word file", ".docx", "docx"] },
+},
+UtilitySpec {
+    id: "lu_create_presentation",
+    description: "Create a PowerPoint presentation (.pptx): slides with a title, bullet points and speaker notes.                   Lu checks the file opens and holds every slide before and after writing it.",
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"ends in .pptx"},"replace":{"type":"boolean"},"slides":{"type":"array","minItems":1,"maxItems":500,"items":{"type":"object","properties":{"title":{"type":"string"},"bullets":{"type":"array","items":{"type":"string"}},"notes":{"type":"string"}},"required":["title"],"additionalProperties":false}}},"required":["path","slides"],"additionalProperties":false}"#,
+    need: Need::Helper,
+    kind: TaskKind::FileWork,
+    trigger: Trigger { extensions: &["pptx"], phrases: &["powerpoint", "presentation", "slide deck", "slides", "deck", "pptx"] },
+},
+UtilitySpec {
+    id: "lu_create_spreadsheet",
+    description: "Create an Excel workbook (.xlsx): named sheets of rows; a cell is a number, true/false, text,                   null (empty) or {\"formula\": \"SUM(B2:B9)\"}. Excel calculates formulas when it opens the file.                   Lu checks the file opens and holds every sheet before and after writing it.",
+    parameters: r#"{"type":"object","properties":{"path":{"type":"string","description":"ends in .xlsx"},"replace":{"type":"boolean"},"sheets":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":31},"rows":{"type":"array","items":{"type":"array","items":{"oneOf":[{"type":"number"},{"type":"boolean"},{"type":"string"},{"type":"null"},{"type":"object","properties":{"formula":{"type":"string"}},"required":["formula"],"additionalProperties":false}]}}}},"required":["name","rows"],"additionalProperties":false}}},"required":["path","sheets"],"additionalProperties":false}"#,
+    need: Need::Helper,
+    kind: TaskKind::FileWork,
+    trigger: Trigger { extensions: &["xlsx"], phrases: &["spreadsheet", "excel", "workbook", "xlsx"] },
+},
+];
 
 /// What Lu knows about the task when it builds the model's tool list.
 #[derive(Debug, Clone, Default)]

@@ -65,3 +65,9 @@ Old: Lu-AI-GUI src-tauri/lu-core/src/native_reader.rs, native_reader_pdf.rs, nat
 Decision: rewrite as `reader.rs` on vetted crates. The old PDF adapter hand-parsed PDF and refused files with object streams (`/ObjStm`), multi-stream `/Contents`, or any non-ASCII glyph bytes (font maps), which covers most PDFs written by Word, LibreOffice or a browser; it also capped files at 12 MiB and 128 pages. New: `pdf-extract` 0.12 (lopdf) for PDF, `calamine` 0.38 for xlsx/xls/xlsb/ods, `zip` 9 + `quick-xml` 0.42 for docx/pptx/odt/odp/epub, own RTF parser. Parsers run under `catch_unwind`; zipped parts are read with a 64 MiB inflate cap (zip bombs); documents over 64 MiB are refused.
 
 Not covered, and reported as such: OCR for scanned PDFs, encrypted PDFs and password-protected workbooks, legacy binary .doc/.ppt. Not ported: the old XLSX range selector (`range:Sheet!A1:B9`); sheets are read whole.
+
+## Piece 10b: Office file creation (new, not ported)
+
+Old: Lu-AI-GUI src-tauri/lu-core/src/native_docx_tool.rs, native_pptx_tool.rs, native_spreadsheet_create.rs, native_spreadsheet_tool.rs, native_artifact_inspect.rs. Not ported: `office.rs` writes the OOXML packages itself (zip + escaped XML) and checks them with Lu's own reader, so creation and the created-file check share one parser. No new crate.
+
+Check order: validate spec, build, inspect bytes (unzips, content-type parts exist, XML well formed, read back in order with the expected sections), staged write, inspect the file on disk. Office's own acceptance needs Office: owner test scripts/owner-tests/office-files.ps1 (NOT_TESTED until run). Not covered: images, styles beyond headings/bullets/tables, charts, cell formatting.
