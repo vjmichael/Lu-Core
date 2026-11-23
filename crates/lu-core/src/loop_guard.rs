@@ -155,7 +155,7 @@ impl ToolLoopGuard {
 // ---------------------------------------------------------------- repairs
 
 /// Failed repairs of one job allowed before Lu stops the model.
-/// A DEFAULT PENDING THE OWNER'S APPROVAL.
+/// Approved by the owner on 2026-11-23.
 pub const DEFAULT_REPAIR_CAP: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
