@@ -57,3 +57,11 @@ Left as is, for later pieces:
 - `ansf_semantic`: search returns an error once a book holds more than 8,192 indexed chunks. That's a hard limit for a long chat; it needs a nearest-neighbour index before semantic recall is used for real.
 - `model_json_boundary`: the code-fence repair only accepts LF line endings, so a fenced reply with CRLF fails to parse. Small; fix when the model boundary is wired.
 - Wiring: nothing calls these modules yet. The ANSF book, the effect journal and the model audit are three separate SQLite files with no shared caller. That caller is piece 1.
+
+## Piece 10a: document reader (rewrite, not port)
+
+Old: Lu-AI-GUI src-tauri/lu-core/src/native_reader.rs, native_reader_pdf.rs, native_reader_docx.rs, native_reader_office.rs, native_reader_odf.rs, native_reader_epub.rs, native_reader_rtf.rs (about 2,700 lines). Reviewed native_reader.rs and native_reader_pdf.rs line by line.
+
+Decision: rewrite as `reader.rs` on vetted crates. The old PDF adapter hand-parsed PDF and refused files with object streams (`/ObjStm`), multi-stream `/Contents`, or any non-ASCII glyph bytes (font maps), which covers most PDFs written by Word, LibreOffice or a browser; it also capped files at 12 MiB and 128 pages. New: `pdf-extract` 0.12 (lopdf) for PDF, `calamine` 0.38 for xlsx/xls/xlsb/ods, `zip` 9 + `quick-xml` 0.42 for docx/pptx/odt/odp/epub, own RTF parser. Parsers run under `catch_unwind`; zipped parts are read with a 64 MiB inflate cap (zip bombs); documents over 64 MiB are refused.
+
+Not covered, and reported as such: OCR for scanned PDFs, encrypted PDFs and password-protected workbooks, legacy binary .doc/.ppt. Not ported: the old XLSX range selector (`range:Sheet!A1:B9`); sheets are read whole.

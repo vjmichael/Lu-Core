@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::ansf_operations::{CommandFinish, CommandStart, FileChange};
 use crate::recorder::{RecordError, Recorder};
 use crate::origin::{path_text, Decision, EffectKind, OriginError, OriginGate, Proposal};
+use crate::reader::{self, Extracted, ReaderError};
 use crate::snapshot::{SnapshotError, SnapshotLimits, SnapshotStore, TrashEntry};
 
 /// Largest content accepted in one write.
@@ -91,8 +92,13 @@ pub struct WriteReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadResult {
     Text { content: String, size: u64, sha256: String, lines: usize },
+    /// A document (PDF, Word, Excel, PowerPoint, OpenDocument, EPUB, RTF):
+    /// its extracted text. `sections` counts pages, sheets, slides or
+    /// chapters; one of them can be read alone with `read_document`.
+    Document { format: &'static str, text: String, truncated: bool, sections: usize, size: u64, sha256: String },
     /// A binary file: its likely type, size, hash and the first bytes in hex.
-    Binary { kind: &'static str, size: u64, sha256: String, hex_preview: String },
+    /// `note` says why a recognized document could not be read as text.
+    Binary { kind: &'static str, size: u64, sha256: String, hex_preview: String, note: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +129,8 @@ pub enum FileError {
     Snapshot(SnapshotError),
     Record(RecordError),
     Origin(OriginError),
+    /// A document could not be read (encrypted, no text layer, invalid, ...).
+    Document(ReaderError),
 }
 impl From<OriginError> for FileError {
     fn from(e: OriginError) -> Self {
@@ -436,7 +444,11 @@ impl<'a> FileAccess<'a> {
             let size = fs::metadata(&target)?.len();
             let mut head = vec![0u8; 8192.min(size as usize)];
             File::open(&target)?.read_exact(&mut head)?;
-            let looks_text = !head.contains(&0) && std::str::from_utf8(&head).is_ok_or_cut();
+            let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // A document's signature wins over looking like text: RTF is
+            // ASCII, and its words matter, not its control codes.
+            let document = reader::classify(&name, &head).is_some();
+            let looks_text = !document && !head.contains(&0) && std::str::from_utf8(&head).is_ok_or_cut();
             if looks_text {
                 if size > MAX_READ_TEXT_BYTES {
                     return Err(FileError::TooLarge { size });
@@ -455,10 +467,57 @@ impl<'a> FileAccess<'a> {
                 }
             }
             let (_, digest) = sha_file(&target)?;
+            let mut note = None;
+            if document {
+                match self.extract(call, &target, size, None, reader::DEFAULT_MAX_CHARS) {
+                    Ok(doc) => {
+                        let summary = format!("document {} {size} bytes sha256={digest}", doc.format.as_str());
+                        let result = ReadResult::Document {
+                            format: doc.format.as_str(),
+                            text: doc.text,
+                            truncated: doc.truncated,
+                            sections: doc.total_sections,
+                            size,
+                            sha256: digest,
+                        };
+                        return Ok((result, summary));
+                    }
+                    Err(FileError::Document(e)) => note = Some(e.to_string()),
+                    Err(e) => return Err(e),
+                }
+            }
             let kind = sniff(&head, &target);
             let preview: String = head.iter().take(HEX_PREVIEW_BYTES).map(|b| format!("{b:02x}")).collect();
             let summary = format!("binary {kind} {size} bytes sha256={digest}");
-            Ok((ReadResult::Binary { kind, size, sha256: digest, hex_preview: preview }, summary))
+            Ok((ReadResult::Binary { kind, size, sha256: digest, hex_preview: preview, note }, summary))
+        })
+    }
+
+    /// Extract a document's text and register it with the origin gate when
+    /// the file came from outside the PC: its words are data, never orders.
+    fn extract(&self, call: &Call, target: &Path, size: u64, selector: Option<&str>, max_chars: usize) -> Result<Extracted, FileError> {
+        if size > reader::MAX_DOCUMENT_BYTES {
+            return Err(FileError::Document(ReaderError::TooLarge { size }));
+        }
+        let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let doc = reader::extract(&name, &fs::read(target)?, selector, max_chars).map_err(FileError::Document)?;
+        if let Some(source) = self.gate.external_file(target)? {
+            self.gate.register_content(self.recorder.session_id(), &call.turn_id, &source, &doc.text)?;
+        }
+        Ok(doc)
+    }
+
+    /// Read one page, sheet, slide (or its notes) or chapter of a document:
+    /// `page:3`, `sheet:Budget`, `slide:2`, `notes:2`, `chapter:4`; or the
+    /// whole document with no selector. This is the "Read documents"
+    /// utility; the basic read already returns a document's full text.
+    pub fn read_document(&self, call: &Call, path: &Path, selector: Option<&str>, max_chars: usize) -> Result<Extracted, FileError> {
+        let target = resolve(path)?;
+        self.recorded(call, "lu.files.read_document", &target, || {
+            let size = fs::metadata(&target)?.len();
+            let doc = self.extract(call, &target, size, selector, max_chars)?;
+            let summary = format!("document {} {} sections, {} chars{}", doc.format.as_str(), doc.total_sections, doc.text.chars().count(), selector.map(|s| format!(" ({s})")).unwrap_or_default());
+            Ok((doc, summary))
         })
     }
 
