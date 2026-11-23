@@ -1,5 +1,5 @@
 use lu_core::resources::{
-    measure, meminfo_mib, Admission, Engine, Governor, Gpu, IdlePolicy, ModelOwner, Need, ResourceError, Sample,
+    measure, meminfo_mib, Admission, Engine, Governor, Gpu, GpuRequest, IdlePolicy, ModelOwner, Need, ResourceError, Sample,
 };
 use std::{
     fs,
@@ -168,25 +168,30 @@ fn a_plugin_borrows_the_memory_and_the_model_comes_back() {
     owner.end_generation();
 
     let nvp = owner.request_unload("nvp", "4K render").unwrap();
-    let ide = owner.request_unload("lu-ide", "full build").unwrap();
+    // A second plug-in cannot share a GPU leased exclusively.
+    assert!(matches!(owner.request_unload("lu-ide", "full build"), Err(ResourceError::Refused(_))));
     assert_eq!(owner.loaded_model(), None);
     assert_eq!(machine.0.lock().unwrap().gpus[0].used_mib, Some(1000), "the VRAM is free for the plug-in");
     // Nothing else may load while the model is set aside.
     assert!(matches!(owner.load("other", 1 << 30, true), Err(ResourceError::Refused(_))));
-    assert_eq!(owner.release(nvp.id).unwrap(), None, "the IDE still holds it");
-    assert_eq!(owner.release(ide.id).unwrap().as_deref(), Some("qwen3.8-27b"));
+    assert_eq!(owner.release(nvp.id).unwrap().as_deref(), Some("qwen3.8-27b"));
     assert_eq!(owner.loaded_model(), Some("qwen3.8-27b"));
-    assert_eq!(owner.release(ide.id), Err(ResourceError::UnknownLease(ide.id)));
+    assert_eq!(owner.release(nvp.id), Err(ResourceError::UnknownLease(nvp.id)));
     // The model was told, in short lines.
     let notices: Vec<_> = gov.notices_for("c-1").unwrap().into_iter().map(|n| n.text).collect();
-    assert!(notices[0].contains("set aside while nvp works"), "{notices:?}");
+    assert!(notices[0].contains("set aside while nvp uses the GPU"), "{notices:?}");
     assert!(notices.last().unwrap().contains("loaded again"));
 
     // If memory is gone when the lease ends, the reload is refused, not forced.
     let lease = owner.request_unload("nvp", "render").unwrap();
-    machine.set(|s| s.gpus[0].used_mib = Some(30_000));
-    assert!(matches!(owner.release(lease.id), Err(ResourceError::Refused(_))));
+    machine.set(|s| s.gpus[0].used_mib = Some(30_000)); // something else took the card
+    assert_eq!(owner.release(lease.id).unwrap(), None);
     assert_eq!(owner.loaded_model(), None);
+    assert!(gov.notices_for("c-1").unwrap().iter().any(|n| n.text.contains("could not be reloaded yet")));
+    // When the memory comes back, the next tick reloads it.
+    machine.set(|s| s.gpus[0].used_mib = Some(1000));
+    owner.tick().unwrap();
+    assert_eq!(owner.loaded_model(), Some("qwen3.8-27b"));
 }
 
 #[test]
@@ -234,4 +239,86 @@ fn real_measurements_on_this_machine() {
 #[ignore = "prints what Lu measures on this machine"]
 fn print_measurements() {
     println!("{:#?}", measure(Some(&std::env::temp_dir())));
+}
+
+fn lease(vram_mib: u64, ttl_ms: u64) -> GpuRequest {
+    GpuRequest { gpu: None, vram_mib, exclusive: false, ttl: Duration::from_millis(ttl_ms) }
+}
+
+#[test]
+fn a_gpu_lease_that_fits_leaves_lus_model_loaded() {
+    let dir = base("lease-fits");
+    let machine = Machine::new(24_000, 1000);
+    let gov = machine.governor(&dir);
+    let mut owner = ModelOwner::new(&gov, FakeEngine { machine: machine.clone(), takes: (1500, 17_000), loaded: Arc::default() }, IdlePolicy::default());
+    owner.load("qwen3.8-27b", 16 << 30, true).unwrap(); // 18,000 of 32,624 MiB used
+    let l = owner.request_gpu("nvp", "LTX 2.5 clip", &lease(10_000, 60_000)).unwrap();
+    assert!(!l.model_set_aside);
+    assert_eq!(owner.loaded_model(), Some("qwen3.8-27b"));
+    // Before NVP allocates, the 10,000 MiB is held back from Lu's loads.
+    let need = Need { vram_mib: 5000, ..Need::default() };
+    match gov.admit("a second model", &need).unwrap() {
+        Admission::Refuse(w) => assert!(w[0].contains("after 10000 MiB held for plug-ins"), "{}", w[0]),
+        other => panic!("{other:?}"),
+    }
+    // Once NVP has taken it, it is not counted twice.
+    machine.set(|s| s.gpus[0].used_mib = Some(28_000));
+    let small = Need { vram_mib: 3000, ..Need::default() };
+    assert_eq!(gov.admit("a small model", &small).unwrap(), Admission::Admit);
+    owner.release(l.id).unwrap();
+    assert!(owner.leases().is_empty());
+}
+
+#[test]
+fn lus_model_is_set_aside_only_if_that_makes_room() {
+    let dir = base("lease-aside");
+    let machine = Machine::new(24_000, 1000);
+    let gov = machine.governor(&dir);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut owner = ModelOwner::new(&gov, FakeEngine { machine: machine.clone(), takes: (1500, 17_000), loaded: log.clone() }, IdlePolicy::default());
+    owner.load("qwen3.8-27b", 16 << 30, true).unwrap();
+    // 40 GB cannot fit even with Lu's model gone: refused, model untouched.
+    match owner.request_gpu("nvp", "LTX 2.5 at 4K", &lease(40_000, 60_000)) {
+        Err(ResourceError::Refused(w)) => assert!(w[0].contains("would free only 17000 MiB more"), "{}", w[0]),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(owner.loaded_model(), Some("qwen3.8-27b"));
+    // 20 GB fits once Lu's model is set aside.
+    let l = owner.request_gpu("nvp", "LTX 2.5", &lease(20_000, 60_000)).unwrap();
+    assert!(l.model_set_aside);
+    assert_eq!(owner.loaded_model(), None);
+    // While NVP holds 20 GB, Lu's 17 GB model cannot come back.
+    assert!(matches!(owner.load("qwen3.8-27b", 16 << 30, true), Err(ResourceError::Refused(_))));
+    // NVP takes its 20 GB, releases the lease while still freeing it: the
+    // reload measures the memory still in use and waits instead of forcing.
+    machine.set(|s| s.gpus[0].used_mib = Some(21_000));
+    assert_eq!(owner.release(l.id).unwrap(), None);
+    assert_eq!(owner.loaded_model(), None);
+    machine.set(|s| s.gpus[0].used_mib = Some(1000));
+    owner.tick().unwrap();
+    assert_eq!(owner.loaded_model(), Some("qwen3.8-27b"));
+    assert_eq!(log.lock().unwrap().last().map(String::as_str), Some("load qwen3.8-27b"));
+}
+
+#[test]
+fn a_crashed_plugins_lease_expires_and_the_model_returns() {
+    let dir = base("lease-expire");
+    let machine = Machine::new(24_000, 1000);
+    let gov = machine.governor(&dir);
+    let policy = IdlePolicy { idle_grace: Duration::from_secs(3600), min_resident: Duration::from_secs(3600) };
+    let mut owner = ModelOwner::new(&gov, FakeEngine { machine: machine.clone(), takes: (1500, 17_000), loaded: Arc::default() }, policy);
+    owner.load("qwen3.8-27b", 16 << 30, true).unwrap();
+    let l = owner.request_gpu("nvp", "LTX 2.5", &GpuRequest { gpu: None, vram_mib: 0, exclusive: true, ttl: Duration::from_millis(100) }).unwrap();
+    thread::sleep(Duration::from_millis(60));
+    owner.renew(l.id).unwrap();
+    thread::sleep(Duration::from_millis(60));
+    owner.tick().unwrap();
+    assert_eq!(owner.leases().len(), 1, "renewed in time");
+    thread::sleep(Duration::from_millis(120));
+    owner.tick().unwrap();
+    assert!(owner.leases().is_empty());
+    assert_eq!(owner.loaded_model(), Some("qwen3.8-27b"));
+    let notices: Vec<_> = gov.notices_for("c-1").unwrap().into_iter().map(|n| n.text).collect();
+    assert!(notices.iter().any(|t| t.contains("did not renew its GPU lease")), "{notices:?}");
+    assert_eq!(owner.renew(l.id), Err(ResourceError::UnknownLease(l.id)));
 }
