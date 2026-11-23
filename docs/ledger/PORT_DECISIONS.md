@@ -48,3 +48,12 @@ About 4,300 lines plus their tests. Baseline = these build and their ported test
 
 Commit 5cc6af2 ports the first set unchanged and adds 6 of the old integration test files (the ones that use only ported modules). 55 tests pass, 0 fail and 0 are ignored, on the owner's PC and in CI on windows-latest and ubuntu-latest (run 45204512700). Status: **compiled**. Not desktop integrated, not real-model exercised.
 Old tests left out because they use modules outside the set: `desktop_owner_recovery.rs` (desktop_owner, read_approval_ledger), plus the continuity, conversation_authority and trash tests.
+
+## Review of the ported set (2026-11-23, commit 55e038f)
+
+Every ported file was read in full. Four bugs were fixed and out-of-scope code removed (see the commit message). 4,697 → 4,099 lines; 55 tests pass on Windows and Linux CI.
+
+Left as is, for later pieces:
+- `ansf_semantic`: search returns an error once a book holds more than 8,192 indexed chunks. That's a hard limit for a long chat; it needs a nearest-neighbour index before semantic recall is used for real.
+- `model_json_boundary`: the code-fence repair only accepts LF line endings, so a fenced reply with CRLF fails to parse. Small; fix when the model boundary is wired.
+- Wiring: nothing calls these modules yet. The ANSF book, the effect journal and the model audit are three separate SQLite files with no shared caller. That caller is piece 1.
