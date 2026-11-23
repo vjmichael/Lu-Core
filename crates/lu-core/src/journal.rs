@@ -110,12 +110,15 @@ impl EffectJournal {
                 call_id TEXT PRIMARY KEY NOT NULL,
                 tool_id TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,
+                workspace_id TEXT,
                 state TEXT NOT NULL CHECK(state IN
                     ('PREPARED','EXECUTING','APPLIED','FAILED','UNCERTAIN')),
                 receipt BLOB,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE INDEX IF NOT EXISTS lu_effects_by_state ON lu_effects(state);",
+            CREATE INDEX IF NOT EXISTS lu_effects_by_state ON lu_effects(state);
+            CREATE INDEX IF NOT EXISTS lu_effects_by_workspace
+              ON lu_effects(workspace_id,state);",
         )?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -132,9 +135,9 @@ impl EffectJournal {
         let mut connection = self.connection.lock().map_err(|_| JournalError::Poisoned)?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO lu_effects(call_id, tool_id, fingerprint, state)
-             VALUES (?1, ?2, ?3, 'PREPARED')",
-            params![call.call_id, call.tool_id, digest],
+            "INSERT OR IGNORE INTO lu_effects(call_id, tool_id, fingerprint, workspace_id, state)
+             VALUES (?1, ?2, ?3, ?4, 'PREPARED')",
+            params![call.call_id, call.tool_id, digest, call.workspace_id],
         )?;
         let outcome = if inserted == 1 {
             PrepareOutcome::New
@@ -218,6 +221,18 @@ impl EffectJournal {
             [],
         )?;
         Ok(count)
+    }
+
+    /// Call IDs of every UNCERTAIN effect for one workspace (conversation),
+    /// oldest first. Used after a restart to bring them back into view.
+    pub fn uncertain_effects(&self, workspace_id: &str) -> Result<Vec<String>, JournalError> {
+        let connection = self.connection.lock().map_err(|_| JournalError::Poisoned)?;
+        let mut stmt = connection.prepare(
+            "SELECT call_id FROM lu_effects
+             WHERE workspace_id=?1 AND state='UNCERTAIN' ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([workspace_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn get(&self, call_id: &str) -> Result<Option<EffectRecord>, JournalError> {

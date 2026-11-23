@@ -27,6 +27,8 @@ pub enum AnsfError {
     NoActiveChapter,
     ChapterAlreadyOpen,
     Locked,
+    /// The action is not backed by a host-authenticated turn of this conversation.
+    NotAuthorized,
 }
 
 impl From<rusqlite::Error> for AnsfError {
@@ -197,6 +199,7 @@ impl AnsfStore {
         crate::ansf_live_chat::initialize_live_chat_schema(&conn)?;
         crate::ansf_goal_records::initialize_goal_record_schema(&conn)?;
         crate::ansf_semantic::initialize_semantic_schema(&conn)?;
+        crate::ansf_operations::initialize_operations_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
