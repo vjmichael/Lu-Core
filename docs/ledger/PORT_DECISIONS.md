@@ -43,3 +43,8 @@ About 4,300 lines plus their tests. Baseline = these build and their ported test
 ## Old-test evidence (Windows, owner's PC, 2026-11-23)
 
 `cargo test --lib` filtered to ansf, journal, native_atomic_write, generation_loop_guard, model_turn_journal, conversation_authority, native_trash_custody: **49 passed, 0 failed, 4 ignored**. The 4 ignored tests are outside the first set (ffprobe, git HEAD, Python process). They need real external programs and were not run. This is the old code's behaviour, the reference that ported copies must match. It is not evidence for Lu-Core itself.
+
+## Baseline recorded (2026-11-23)
+
+Commit 5cc6af2 ports the first set unchanged and adds 6 of the old integration test files (the ones that use only ported modules). 55 tests pass, 0 fail and 0 are ignored, on the owner's PC and in CI on windows-latest and ubuntu-latest (run 45204512700). Status: **compiled**. Not desktop integrated, not real-model exercised.
+Old tests left out because they use modules outside the set: `desktop_owner_recovery.rs` (desktop_owner, read_approval_ledger), plus the continuity, conversation_authority and trash tests.

@@ -16,4 +16,4 @@
 | 11 | Resource management | designed | — |
 | 12 | Hugging Face search + staged download | designed | — |
 | 13 | Backends + engine updater | designed | — |
-| B | First baseline (ported set builds + passes on Windows and Linux) | not reached; port set chosen | docs/ledger/PORT_DECISIONS.md |
+| B | First baseline (ported set builds + passes on Windows and Linux) | compiled | 5cc6af2: 55 passed, 0 failed, 0 ignored on owner PC, CI windows-latest and ubuntu-latest (run 45204512700) |
