@@ -344,6 +344,15 @@ impl SnapshotStore {
                sha256 TEXT NOT NULL,
                restorable TEXT NOT NULL CHECK(restorable IN ('blob','git','none')),
                PRIMARY KEY(snapshot_id,path)
+             );
+             CREATE TABLE IF NOT EXISTS trash(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               original_path TEXT NOT NULL,
+               stored_name TEXT NOT NULL UNIQUE,
+               size INTEGER NOT NULL,
+               sha256 TEXT NOT NULL,
+               trashed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+               restored INTEGER NOT NULL DEFAULT 0 CHECK(restored IN (0,1))
              );",
         )?;
         Ok(Self { root, conn: Mutex::new(conn) })
@@ -383,7 +392,30 @@ impl SnapshotStore {
         }
         files.sort();
         files.dedup_by(|a, b| a.0 == b.0);
+        self.record(scope, files, git_scope.map(|g| g.prefix), git_commit, skipped, limits)
+    }
 
+    /// Snapshot one file before Lu writes, moves or deletes it. Always a copy
+    /// (no Git), so it is cheap and independent of the folder around it.
+    pub fn take_file(&self, path: &Path, limits: SnapshotLimits) -> Result<SnapshotInfo, SnapshotError> {
+        let path = canonical(path)?;
+        if !path.is_file() {
+            return Err(SnapshotError::InvalidPath);
+        }
+        let scope = path.parent().ok_or(SnapshotError::InvalidPath)?.to_path_buf();
+        let name = path.file_name().and_then(|n| n.to_str()).ok_or(SnapshotError::InvalidPath)?;
+        self.record(scope, vec![(name.to_owned(), false)], None, None, 0, limits)
+    }
+
+    fn record(
+        &self,
+        scope: PathBuf,
+        files: Vec<(String, bool)>,
+        git_prefix: Option<String>,
+        git_commit: Option<String>,
+        mut skipped: usize,
+        limits: SnapshotLimits,
+    ) -> Result<SnapshotInfo, SnapshotError> {
         let mut conn = self.conn.lock().map_err(|_| SnapshotError::Locked)?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -391,9 +423,9 @@ impl SnapshotStore {
              VALUES(?1,?2,?3,?4,0,?5)",
             params![
                 scope.to_string_lossy(),
-                if git_scope.is_some() { "git" } else { "copy" },
+                if git_commit.is_some() { "git" } else { "copy" },
                 git_commit,
-                git_scope.as_ref().map(|g| g.prefix.clone()),
+                git_prefix,
                 skipped as i64
             ],
         )?;
@@ -565,5 +597,71 @@ impl SnapshotStore {
             return Err(SnapshotError::IntegrityMismatch);
         }
         atomic_write(&scope.join(path), &bytes)
+    }
+}
+
+/// One file in Lu's recoverable trash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashEntry {
+    pub id: i64,
+    pub original_path: PathBuf,
+    pub size: u64,
+    pub sha256: String,
+}
+
+impl SnapshotStore {
+    /// Move a file into Lu's trash instead of deleting it. The file is moved
+    /// (renamed) when the trash is on the same volume, otherwise copied,
+    /// checked against its hash, and only then removed.
+    pub fn trash(&self, path: &Path) -> Result<TrashEntry, SnapshotError> {
+        let path = canonical(path)?;
+        if !path.is_file() {
+            return Err(SnapshotError::InvalidPath);
+        }
+        let state = hash_file(&path, None)?;
+        let dir = self.root.join("trash");
+        fs::create_dir_all(&dir)?;
+        let stored_name = format!("{}-{}", unique_suffix(), state.sha256);
+        let stored = dir.join(&stored_name);
+        if fs::rename(&path, &stored).is_err() {
+            fs::copy(&path, &stored)?;
+            if hash_file(&stored, None)? != state {
+                let _ = fs::remove_file(&stored);
+                return Err(SnapshotError::IntegrityMismatch);
+            }
+            fs::remove_file(&path)?;
+        }
+        let conn = self.conn.lock().map_err(|_| SnapshotError::Locked)?;
+        conn.execute(
+            "INSERT INTO trash(original_path,stored_name,size,sha256) VALUES(?1,?2,?3,?4)",
+            params![path.to_string_lossy(), stored_name, state.size as i64, state.sha256],
+        )?;
+        Ok(TrashEntry { id: conn.last_insert_rowid(), original_path: path, size: state.size, sha256: state.sha256 })
+    }
+
+    /// Put a trashed file back where it was. Refused when something now
+    /// exists at that path, so a restore never overwrites newer work.
+    pub fn restore_trashed(&self, id: i64) -> Result<PathBuf, SnapshotError> {
+        let conn = self.conn.lock().map_err(|_| SnapshotError::Locked)?;
+        let (original, stored_name, size, sha256): (String, String, i64, String) = conn
+            .query_row(
+                "SELECT original_path,stored_name,size,sha256 FROM trash WHERE id=?1 AND restored=0",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .ok_or(SnapshotError::NotRestorable)?;
+        let original = PathBuf::from(original);
+        if original.exists() {
+            return Err(SnapshotError::NotRestorable);
+        }
+        let bytes = fs::read(self.root.join("trash").join(&stored_name))?;
+        if !matches(&bytes, &FileState { size: size as u64, sha256 }) {
+            return Err(SnapshotError::IntegrityMismatch);
+        }
+        atomic_write(&original, &bytes)?;
+        fs::remove_file(self.root.join("trash").join(&stored_name))?;
+        conn.execute("UPDATE trash SET restored=1 WHERE id=?1", [id])?;
+        Ok(original)
     }
 }
