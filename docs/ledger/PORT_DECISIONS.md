@@ -77,3 +77,11 @@ Check order: validate spec, build, inspect bytes (unzips, content-type parts exi
 Old: Lu-AI-GUI src-tauri/lu-core/src/native_zip_extract*.rs, native_iso9660.rs, native_iso_extract_tool.rs, native_linux_archive*.rs, native_libarchive.rs, native_archive_*.rs. Reviewed native_iso9660.rs: it refused any non-ASCII or Joliet name (most real discs), and the Linux path went through libarchive. Not ported.
 
 New `archive.rs`: zip (zip), tar/tar.gz/tar.xz/tar.bz2/gz (tar, flate2, lzma-rust2, bzip2 with its pure-Rust backend), 7z (sevenz-rust2, CRC checked), ISO 9660 + Joliet (own reader). Same path rules on every system (no absolute, drive, `..`, device names, `:` streams, Windows-invalid characters, case clashes); links and devices skipped; staging folder renamed into place only on success; bytes, entries and expansion ratio counted while writing. Not covered: UDF-only ISOs (reported, 7-Zip suggested), encrypted zip/7z, RAR, bare .xz/.bz2 that are not tarballs.
+
+## Piece 12: Hugging Face search and staged download
+
+Ported: Lu-AI-GUI src-tauri/lu-core/src/model_provider_catalog.rs (repo, revision, SHA-256 and gated/private rules) into `hf.rs`, extended with one-folder-deep files, split sets, quantization labels, projectors and imatrix skipping. gguf_preflight.rs and gguf_metadata_summary.rs (header rules and bounded metadata walk) merged into `gguf.rs`, plus general.name and projector detection.
+
+Not ported: model_provider_transport.rs and model_provider_staging.rs, which ran a pinned curl binary with DNS pinning. Replaced by in-process ureq + rustls, redirects followed by Lu only to HTTPS hosts under huggingface.co / hf.co, resume by Range with Content-Range check (a server ignoring Range restarts cleanly), SHA-256 while writing, GGUF check before the rename. mmproj_admission.rs: the rule "pairing is the user's explicit choice, never guessed" kept as a registry column.
+
+Hub file names are not the user's words, so a model-proposed install is held by the origin gate and approved in a later user message (`install_approved`, bound to the exact repo, commit and files). No token handling: gated and private repos are shown as unavailable.

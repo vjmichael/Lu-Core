@@ -23,6 +23,7 @@ sevenz-rust2 = "0.20.2"
 bzip2 = "0.6.1"
 lzma-rust2 = "0.16.5"
 crc32fast = "1.5.5"
+ureq = "3.5.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

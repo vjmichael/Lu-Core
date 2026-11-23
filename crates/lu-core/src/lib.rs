@@ -28,4 +28,6 @@ pub mod reader;
 pub mod office;
 pub mod archive;
 pub mod resources;
+pub mod gguf;
+pub mod hf;
 pub mod utilities;
