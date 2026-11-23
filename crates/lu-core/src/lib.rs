@@ -27,4 +27,5 @@ pub mod profile;
 pub mod reader;
 pub mod office;
 pub mod archive;
+pub mod resources;
 pub mod utilities;
