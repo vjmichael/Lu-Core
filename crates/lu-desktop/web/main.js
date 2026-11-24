@@ -485,7 +485,11 @@ function drawStatus(st) {
   const bar = $("#loadbar");
   bar.classList.toggle("hidden", st.state !== "loading");
   bar.firstElementChild.style.width = Math.round((st.progress || 0) * 100) + "%";
-  if (st.state === "error" && st.message) toast(st.message, 8000);
+  if (st.state === "error" && st.message && st.can_force && st.model_id != null && !st._asked) {
+    st._asked = true;
+    choiceBox("Not enough free memory", st.message, [{ label: "Load anyway", value: "force" }, { label: "Don’t load", value: "no", primary: true }])
+      .then((v) => { if (v === "force") call("load_model", { id: st.model_id, force: true }); });
+  } else if (st.state === "error" && st.message) toast(st.message, 8000);
   if (messages.querySelector(".empty")) showEmpty();
   drawReasoning();
 }

@@ -39,8 +39,34 @@ pub struct GgufInfo {
     pub file_type: Option<u32>,
     /// `split.count` for a model split across several files.
     pub split_count: Option<u32>,
+    /// Shape, for the context cache estimate (`<arch>.block_count`, ...).
+    pub block_count: Option<u64>,
+    pub embedding_length: Option<u64>,
+    pub head_count: Option<u64>,
+    pub head_count_kv: Option<u64>,
+    pub key_length: Option<u64>,
+    pub value_length: Option<u64>,
+    /// Hybrid models keep a context cache only on every n-th layer.
+    pub full_attention_interval: Option<u64>,
 }
 impl GgufInfo {
+    /// The context cache for `context` tokens at 16-bit precision, in MiB;
+    /// `None` when the file does not describe its shape.
+    pub fn kv_cache_mib(&self, context: u64) -> Option<u64> {
+        let layers = self.block_count?;
+        let layers = match self.full_attention_interval {
+            Some(n) if n > 1 => layers.div_ceil(n),
+            _ => layers,
+        };
+        let heads = self.head_count?;
+        let kv_heads = self.head_count_kv.filter(|&h| h > 0).unwrap_or(heads);
+        let head_dim = self.embedding_length.map(|e| e / heads.max(1));
+        let dk = self.key_length.or(head_dim)?;
+        let dv = self.value_length.or(Some(dk))?;
+        let bytes = context.saturating_mul(layers).saturating_mul(kv_heads).saturating_mul(dk + dv).saturating_mul(2);
+        Some(bytes.div_ceil(1024 * 1024))
+    }
+
     /// A vision/audio projector (mmproj), not a model on its own.
     pub fn is_projector(&self) -> bool {
         self.architecture.as_deref() == Some("clip")
@@ -192,6 +218,7 @@ pub fn inspect(path: &Path) -> Result<GgufInfo, GgufError> {
     }
     let mut info = GgufInfo { version, tensor_count, metadata_count, file_bytes: len, ..GgufInfo::default() };
     let mut contexts: Vec<(String, u64)> = Vec::new();
+    let mut shape: Vec<(String, u64)> = Vec::new();
     for _ in 0..metadata_count {
         let key = w.string()?.unwrap_or_default();
         let kind = w.u32()?;
@@ -200,6 +227,11 @@ pub fn inspect(path: &Path) -> Result<GgufInfo, GgufError> {
             ("general.name", 8) => info.name = w.string()?,
             ("general.file_type", _) => info.file_type = w.number(kind)?.map(|v| v as u32),
             ("split.count", _) => info.split_count = w.number(kind)?.map(|v| v as u32),
+            (k, _) if [".block_count", ".embedding_length", ".attention.head_count", ".attention.head_count_kv", ".attention.key_length", ".attention.value_length", ".full_attention_interval"].iter().any(|s| k.ends_with(s)) => {
+                if let Some(v) = w.number(kind)? {
+                    shape.push((k.to_owned(), v));
+                }
+            }
             (k, _) if k.ends_with(".context_length") => {
                 if let Some(v) = w.number(kind)? {
                     contexts.push((k.trim_end_matches(".context_length").to_owned(), v));
@@ -214,6 +246,15 @@ pub fn inspect(path: &Path) -> Result<GgufInfo, GgufError> {
         .find(|(arch, _)| Some(arch.as_str()) == info.architecture.as_deref())
         .or(contexts.first())
         .map(|(_, v)| *v);
+    let arch = info.architecture.clone().unwrap_or_default();
+    let get = |suffix: &str| shape.iter().find(|(k, _)| *k == format!("{arch}.{suffix}")).map(|(_, v)| *v);
+    info.block_count = get("block_count");
+    info.embedding_length = get("embedding_length");
+    info.head_count = get("attention.head_count");
+    info.head_count_kv = get("attention.head_count_kv");
+    info.key_length = get("attention.key_length");
+    info.value_length = get("attention.value_length");
+    info.full_attention_interval = get("full_attention_interval");
     Ok(info)
 }
 

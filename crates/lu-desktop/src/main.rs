@@ -39,7 +39,7 @@ use lu_core::{
     journal::EffectJournal,
     origin::OriginGate,
     recorder::Recorder,
-    resources::{measure, Governor},
+    resources::{self, measure, Governor},
     runner::{CancelToken, CommandRunner},
     snapshot::{SnapshotLimits, SnapshotStore},
 };
@@ -126,10 +126,22 @@ struct ModelStatus {
     busy: bool,
     /// Reasoning settings the loaded model takes (empty: none).
     reasoning: Vec<String>,
+    /// The load was refused for lack of memory; the user may load anyway.
+    can_force: bool,
+}
+
+/// The memory a model takes, estimated from its file: weights (with the
+/// image file), the context cache for its context length, and buffers.
+fn estimate_mib(model: &ModelEntry) -> u64 {
+    let weights = model.bytes.div_ceil(1024 * 1024);
+    let projector = model.projector.as_ref().and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len().div_ceil(1024 * 1024));
+    let kv = gguf::inspect(Path::new(&model.path)).ok().and_then(|i| i.kv_cache_mib(u64::from(model.settings.context))).unwrap_or(weights / 4);
+    weights + projector + kv + 512 + weights / 20
 }
 
 enum Job {
-    Load(i64),
+    /// Load a model; `force` loads even when Lu measured it does not fit.
+    Load(i64, bool),
     Unload,
     Send { chat: String, text: String, attachments: Vec<String>, reasoning: Option<String> },
 }
@@ -192,7 +204,7 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                 }
                 set_status(&app, &status, |s| *s = ModelStatus { state: "unloaded".into(), ..Default::default() });
             }
-            Job::Load(id) => {
+            Job::Load(id, force) => {
                 if let Some((mut e, _)) = engine.take() {
                     let _ = lu_core::resources::Engine::unload(&mut e);
                 }
@@ -248,6 +260,39 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                     })
                 };
                 let gpu = !measure(None).gpus.is_empty();
+                // Does it fit? Measured from its last load with these
+                // settings, or estimated from the file (weights + context cache).
+                let on_gpu = gpu && model.settings.backend != "cpu";
+                let key = format!("{}#ctx{}", model.path, model.settings.context);
+                let estimate = estimate_mib(&model);
+                let fp = base.governor.measured_footprint(&key).ok().flatten();
+                let (need_ram, need_vram) = match (&fp, on_gpu) {
+                    (Some(f), _) => (f.ram_mib, f.vram_mib),
+                    (None, true) => (1024, estimate),
+                    (None, false) => (estimate, 0),
+                };
+                if !force {
+                    let need = resources::Need { ram_mib: need_ram, vram_mib: need_vram, ..Default::default() };
+                    match base.governor.admit(&format!("load {}", model.name), &need) {
+                        Ok(resources::Admission::Admit) => {}
+                        Ok(resources::Admission::Refuse(why)) | Ok(resources::Admission::Unmeasured(why)) => {
+                            done.store(true, Ordering::Relaxed);
+                            let _ = ticker.join();
+                            let gb = |m: u64| format!("{:.1} GB", m as f64 / 1024.0);
+                            let what = if on_gpu { format!("about {} of graphics memory", gb(need_vram)) } else { format!("about {} of memory", gb(need_ram)) };
+                            let msg = format!(
+                                "{} needs {what}{}, more than is free now, so Lu did not load it (loading it could slow the computer to a crawl). Close other programs that use the GPU, pick a smaller version, or lower its context length. Details: {}",
+                                model.name,
+                                if fp.is_some() { " (measured last time)" } else { " (estimated)" },
+                                why.join("; ")
+                            );
+                            set_status(&app, &status, |s| *s = ModelStatus { state: "error".into(), model_id: Some(id), model: Some(model.name.clone()), message: Some(msg), can_force: true, ..Default::default() });
+                            continue;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                let before = measure(None);
                 let settings = RunSettings {
                     context: model.settings.context,
                     gpu_layers: model.settings.gpu_layers,
@@ -259,6 +304,19 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                 let _ = ticker.join();
                 match result {
                     Ok((server, _failed)) => {
+                        // Remember what this load really took, for next time.
+                        let after = measure(None);
+                        let vram = match (before.gpus.first().and_then(|g| g.used_mib), after.gpus.first().and_then(|g| g.used_mib)) {
+                            (Some(a), Some(b)) => b.saturating_sub(a),
+                            _ => 0,
+                        };
+                        let ram = match (before.ram_available_mib, after.ram_available_mib) {
+                            (Some(a), Some(b)) => a.saturating_sub(b),
+                            _ => 0,
+                        };
+                        if vram + ram > 256 {
+                            let _ = base.governor.record_footprint(&key, ram, vram);
+                        }
                         let backend = match server.build.variant {
                             Variant::Rocm => "ROCm",
                             Variant::Vulkan => "Vulkan",
@@ -574,8 +632,8 @@ fn model_status(app: State<App>) -> R<ModelStatus> {
     Ok(app.status.lock().map_err(s)?.clone())
 }
 #[tauri::command]
-fn load_model(app: State<App>, id: i64) -> R<()> {
-    app.jobs.lock().map_err(s)?.send(Job::Load(id)).map_err(s)
+fn load_model(app: State<App>, id: i64, force: Option<bool>) -> R<()> {
+    app.jobs.lock().map_err(s)?.send(Job::Load(id, force.unwrap_or(false))).map_err(s)
 }
 #[tauri::command]
 fn unload_model(app: State<App>) -> R<()> {

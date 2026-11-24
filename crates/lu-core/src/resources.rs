@@ -480,6 +480,15 @@ impl Governor {
 
     /// What `model` takes when loaded: measured from its last load, or an
     /// estimate from the file size for a model never loaded.
+    /// A footprint measured from an earlier load, if there was one.
+    pub fn measured_footprint(&self, model: &str) -> Result<Option<Footprint>, ResourceError> {
+        let row: Option<(i64, i64)> = self
+            .db()?
+            .query_row("SELECT ram_mib, vram_mib FROM lu_model_footprints WHERE model = ?1", params![model], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        Ok(row.map(|(ram, vram)| Footprint { ram_mib: ram as u64, vram_mib: vram as u64, measured: true }))
+    }
+
     pub fn footprint(&self, model: &str, file_bytes: u64, gpu_offload: bool) -> Result<Footprint, ResourceError> {
         let row: Option<(i64, i64)> = self
             .db()?
@@ -498,7 +507,8 @@ impl Governor {
             Footprint { ram_mib: with_cache, vram_mib: 0, measured: false }
         })
     }
-    fn record_footprint(&self, model: &str, ram_mib: u64, vram_mib: u64) -> Result<(), ResourceError> {
+    /// What a load really took (measured after it), for the next estimate.
+    pub fn record_footprint(&self, model: &str, ram_mib: u64, vram_mib: u64) -> Result<(), ResourceError> {
         self.db()?.execute(
             "INSERT INTO lu_model_footprints(model, ram_mib, vram_mib, loads) VALUES (?1, ?2, ?3, 1)
              ON CONFLICT(model) DO UPDATE SET ram_mib = excluded.ram_mib, vram_mib = excluded.vram_mib,
