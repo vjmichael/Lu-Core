@@ -600,3 +600,46 @@ fn the_shipped_rocm_pack_list_is_valid() {
     assert_eq!(p.files.iter().filter(|f| f.path.contains("LICENSE")).count(), 7);
     assert!(p.serves("AMD Radeon AI PRO R9700") && p.serves("AMD Radeon RX 9070 XT") && !p.serves("AMD Radeon RX 7900 XTX"));
 }
+
+#[test]
+fn an_installer_bundle_sets_up_engines_and_packs_without_the_network() {
+    let lu = lu("bundle");
+    let turn = say(&lu, 1, "Set up the engines that came with Lu");
+    let bundle = lu.dir.join("bundled");
+    fs::create_dir_all(bundle.join("packs")).unwrap();
+    // The bundled engine archive, under its pinned name.
+    let (ext, cpu_bytes) = release(&[], None);
+    let cpu = pin("b100", Variant::Cpu, &ext, &cpu_bytes);
+    fs::write(bundle.join(&cpu.asset), &cpu_bytes).unwrap();
+    // The bundled pack: its pinned files, unpacked.
+    let (src_tar, files) = pack_source();
+    let pack = pack_pin("rocm-bundle-gfx120X", &src_tar, &files);
+    for (p, d) in &files {
+        let f = p.split('/').fold(bundle.join("packs").join(&pack.name), |a, c| a.join(c));
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(f, d).unwrap();
+    }
+    let src = EngineSource::with_bundle(&bundle);
+    let rec = Recorder::new(&lu.book, &lu.journal, "c-1");
+    let store = EngineStore::open(&lu.dir.join("engines"), vec![cpu.clone()], &src, &rec, &lu.gate, &lu.governor).unwrap();
+    let b = store.install("e-1", &turn, &cpu, true, &AtomicBool::new(false), &mut no_progress()).unwrap();
+    assert!(b.active && b.server.is_file(), "installed from the bundle, no network");
+    let dir = store.install_pack_from_folder("p-1", &turn, &pack, &bundle.join("packs").join(&pack.name), &mut no_progress()).unwrap();
+    assert!(dir.join("bin/hipblas.dll").is_file() && dir.join("share/doc/rocblas/LICENSE.md").is_file());
+    assert_eq!(store.runtime_dirs(Variant::Rocm).unwrap(), [dir.join("bin")]);
+    assert!(bundle.join(&cpu.asset).is_file(), "the bundle is left as it is");
+
+    // A tampered bundle is refused: a changed archive, a changed pack file.
+    let lu2 = lu_named(&lu, "bundle-bad");
+    let turn2 = say(&lu2, 1, "Set up the engines that came with Lu");
+    fs::write(bundle.join(&cpu.asset), [cpu_bytes.as_slice(), b"x"].concat()[1..].to_vec()).unwrap();
+    let rec2 = Recorder::new(&lu2.book, &lu2.journal, "c-1");
+    let store2 = EngineStore::open(&lu2.dir.join("engines"), vec![cpu.clone()], &src, &rec2, &lu2.gate, &lu2.governor).unwrap();
+    assert!(store2.install("e-1", &turn2, &cpu, true, &AtomicBool::new(false), &mut no_progress()).is_err(), "a changed archive never installs");
+    fs::write(bundle.join("packs").join(&pack.name).join("bin").join("rocblas.dll"), b"MZ tampered").unwrap();
+    assert!(store2.install_pack_from_folder("p-1", &turn2, &pack, &bundle.join("packs").join(&pack.name), &mut no_progress()).is_err(), "a changed pack file never installs");
+    assert!(store2.installed_packs().unwrap().is_empty());
+}
+fn lu_named(_: &Lu, name: &str) -> Lu {
+    lu(name)
+}

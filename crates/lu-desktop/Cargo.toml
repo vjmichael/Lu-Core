@@ -24,3 +24,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [features]
 # Bundle the web files into the binary (release builds and installers).
 custom-protocol = ["tauri/custom-protocol"]
+# The installed Lu: its own data folder (%LOCALAPPDATA%\Lu) and web storage.
+installed = []

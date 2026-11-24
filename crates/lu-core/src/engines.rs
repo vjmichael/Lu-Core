@@ -293,17 +293,24 @@ pub struct EngineSource {
     agent: ureq::Agent,
     /// Replaces `https://github.com/ggml-org/llama.cpp/releases/download` in tests.
     local_base: Option<String>,
+    /// A folder of pinned archives that came with Lu's installer; used
+    /// before the network, and checked against the pin like a download.
+    bundle: Option<PathBuf>,
 }
 impl EngineSource {
     pub fn github() -> Self {
-        Self { agent: agent(false), local_base: None }
+        Self { agent: agent(false), local_base: None, bundle: None }
+    }
+    /// GitHub, but first the pinned archives in `dir` (shipped with Lu).
+    pub fn with_bundle(dir: &Path) -> Self {
+        Self { agent: agent(false), local_base: None, bundle: Some(dir.to_path_buf()) }
     }
     pub fn local_test(base: &str) -> Result<Self, EngineError> {
         let host = base.strip_prefix("http://").and_then(|r| r.split(['/', ':']).next()).unwrap_or("");
         if !matches!(host, "127.0.0.1" | "localhost") {
             return Err(EngineError::Invalid("a test source must be on loopback".into()));
         }
-        Ok(Self { agent: agent(true), local_base: Some(base.trim_end_matches('/').to_owned()) })
+        Ok(Self { agent: agent(true), local_base: Some(base.trim_end_matches('/').to_owned()), bundle: None })
     }
     fn url(&self, pin: &Pin) -> String {
         match &self.local_base {
@@ -323,6 +330,17 @@ impl EngineSource {
     }
     /// Download `pin` to `part`, resuming, checking size and SHA-256.
     fn fetch(&self, pin: &Pin, part: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64)) -> Result<(), EngineError> {
+        // The installer's copy, if it is there and the right size; the hash
+        // is checked below exactly as for a download.
+        if let Some(local) = self.bundle.as_ref().map(|d| d.join(&pin.asset)).filter(|p| fs::metadata(p).ok().map(|m| m.len()) == Some(pin.bytes)) {
+            if fs::metadata(part).map(|m| m.len()).unwrap_or(0) != pin.bytes {
+                if let Some(dir) = part.parent() {
+                    fs::create_dir_all(dir)?;
+                }
+                fs::copy(&local, part)?;
+            }
+            progress(pin.bytes, pin.bytes);
+        }
         self.fetch_file(&self.url(pin), &pin.asset, pin.bytes, &pin.sha256, part, cancel, progress)
     }
 
@@ -877,6 +895,77 @@ impl<'a> EngineStore<'a> {
             })
             .map_err(|e| EngineError::Database(format!("{e:?}")))?;
         result
+    }
+
+    /// Install a runtime pack from a folder holding its files (as Lu's
+    /// installer ships it): every pinned file is checked for size and
+    /// SHA-256 before the pack is registered. The user's instruction; the
+    /// origin gate decides.
+    pub fn install_pack_from_folder(&self, call_id: &str, turn_id: &str, pack: &RuntimePack, folder: &Path, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf, EngineError> {
+        let proposal = Proposal { session_id: self.recorder.session_id().to_owned(), turn_id: turn_id.to_owned(), call_id: call_id.to_owned(), effect: EffectKind::Install, text: Self::pack_summary(pack) };
+        match self.gate.decide(self.recorder.book(), &proposal).map_err(|e| EngineError::Database(format!("{e:?}")))? {
+            Decision::Run => {}
+            Decision::Hold { held_id, notify, .. } => return Err(EngineError::Held { held_id, notify_user: notify }),
+            Decision::Refuse { source } => return Err(EngineError::Invalid(format!("refused: asked for by {}", source.reference))),
+        }
+        if let Some((_, _, dir)) = self.installed_packs()?.into_iter().find(|(n, _, _)| n == &pack.name) {
+            return Ok(dir);
+        }
+        let staging = self.root.join(".staging").join(format!("{}-unpacked", pack.name));
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        let fail = |e: EngineError| {
+            let _ = fs::remove_dir_all(&staging);
+            e
+        };
+        let total = pack.installed_bytes();
+        let mut done_bytes = 0u64;
+        for file in &pack.files {
+            let parts = crate::archive::safe_relative(&file.path).map_err(|why| fail(EngineError::Invalid(format!("{}: {why}", file.path))))?;
+            let from = parts.iter().fold(folder.to_path_buf(), |p, c| p.join(c));
+            let to = parts.iter().fold(staging.clone(), |p, c| p.join(c));
+            fs::create_dir_all(to.parent().unwrap_or(&staging)).map_err(|e| fail(e.into()))?;
+            let mut input = File::open(&from).map_err(|_| fail(EngineError::Invalid(format!("the bundled pack lacks {}", file.path))))?;
+            let mut out = File::create(&to).map_err(|e| fail(e.into()))?;
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            let mut n = 0u64;
+            loop {
+                let k = input.read(&mut buf).map_err(|e| fail(e.into()))?;
+                if k == 0 {
+                    break;
+                }
+                n += k as u64;
+                if n > file.bytes {
+                    return Err(fail(EngineError::Invalid(format!("{} is larger than pinned", file.path))));
+                }
+                out.write_all(&buf[..k]).map_err(|e| fail(e.into()))?;
+                hasher.update(&buf[..k]);
+            }
+            let actual = format!("{:x}", hasher.finalize());
+            if n != file.bytes || actual != file.sha256 {
+                return Err(fail(EngineError::HashMismatch { expected: format!("{} {}", file.path, file.sha256), actual }));
+            }
+            done_bytes += n;
+            progress(done_bytes, total);
+        }
+        let dir = self.root.join("runtime").join(&pack.name);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        fs::create_dir_all(dir.parent().unwrap_or(&self.root))?;
+        fs::rename(&staging, &dir)?;
+        let source = Source { kind: SourceKind::RemoteService, reference: pack.source.url.clone() };
+        for f in pack.files.iter().filter(|f| f.path.to_ascii_lowercase().ends_with(".dll") || f.path.to_ascii_lowercase().ends_with(".so")) {
+            let p = f.path.split('/').fold(dir.clone(), |p, c| p.join(c));
+            self.gate.mark_external_file(&p, &source).map_err(|e| EngineError::Database(format!("{e:?}")))?;
+        }
+        self.db()?.execute(
+            "INSERT INTO lu_runtime_packs(name, variant, dir, source_sha256, files) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![pack.name, pack.for_variant.as_str(), dir.to_string_lossy(), pack.source.sha256, pack.files.len() as i64],
+        )?;
+        Ok(dir)
     }
 
     /// Take exactly the pinned files out of the source archive, checking

@@ -13,3 +13,4 @@ Checked 2026-11-23. Nothing was installed; everything required was already prese
 | Git | 2.56.0.windows.4 | No |
 | Protobuf compiler | libprotoc 36.2 | No |
 | GitHub CLI | 2.103.2 | No |
+| NSIS 3.13 (makensis, C:\Program Files (x86)\NSIS; not on PATH) | Found 2026-11-24 when winget install NSIS.NSIS reported it already installed; used by scripts/build-installer.ps1 | No |

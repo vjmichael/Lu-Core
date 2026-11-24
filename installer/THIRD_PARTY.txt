@@ -1,0 +1,14 @@
+Lu bundles these third-party components, unchanged, as published:
+
+llama.cpp release b12651 (CPU, Vulkan and ROCm builds for Windows x64)
+  https://github.com/ggml-org/llama.cpp - MIT License.
+  The licence files are inside each archive in the "bundled" folder.
+
+AMD ROCm 10.0.0 runtime libraries for gfx120X (rocm-10.0.0-gfx120X):
+  hipBLAS, rocBLAS, rocSOLVER, hipBLASLt and their kernels, from AMD's
+  TheRock release tarball. Licence files are in
+  bundled\packs\rocm-10.0.0-gfx120X\share\doc and, after first start, in
+  %LOCALAPPDATA%\Lu\engines\runtime\rocm-10.0.0-gfx120X\share\doc.
+
+Each archive and file is checked against the SHA-256 that Lu pins
+(crates\lu-core\pins) before Lu uses it.

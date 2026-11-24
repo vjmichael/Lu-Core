@@ -83,7 +83,7 @@ impl Base {
             snapshots: SnapshotStore::open(&data.join("snapshots")).map_err(|e| format!("{e:?}"))?,
             environment: EnvironmentStore::open(&data.join("environment.sqlite")).map_err(|e| format!("{e:?}"))?,
             hub: Hub::official(),
-            source: EngineSource::github(),
+            source: bundle_dir().map(|d| EngineSource::with_bundle(&d)).unwrap_or_else(EngineSource::github),
             control,
             dx: DxStore::open(data)?,
             data: data.to_path_buf(),
@@ -112,7 +112,94 @@ fn data_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     let base = if cfg!(windows) { std::env::var_os("LOCALAPPDATA") } else { std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share").into_os_string()) };
-    PathBuf::from(base.unwrap_or_default()).join(if cfg!(windows) { "Lu-Dev" } else { "lu-dev" })
+    // The installed Lu has its own folder; development builds never use it.
+    let name = match (cfg!(feature = "installed"), cfg!(windows)) {
+        (true, true) => "Lu",
+        (true, false) => "lu",
+        (false, true) => "Lu-Dev",
+        (false, false) => "lu-dev",
+    };
+    PathBuf::from(base.unwrap_or_default()).join(name)
+}
+
+/// The pinned engines and runtime packs that came with Lu's installer
+/// (`<install folder>/bundled`), if any.
+fn bundle_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.join("bundled");
+    dir.is_dir().then_some(dir)
+}
+
+/// Each window keeps its own web storage in Lu's data folder, so the
+/// installed Lu and development builds never share settings.
+fn webview_data<'a, M: Manager<tauri::Wry>>(b: WebviewWindowBuilder<'a, tauri::Wry, M>) -> WebviewWindowBuilder<'a, tauri::Wry, M> {
+    if cfg!(feature = "installed") {
+        b.data_directory(data_dir().join("webview"))
+    } else {
+        b
+    }
+}
+
+/// First start of an installed Lu: install the engines that came with it,
+/// from the bundled archives, through the same checks as a download
+/// (SHA-256 against the pins, smoke test, GPU check). Runs once; later
+/// starts find them installed and do nothing.
+fn setup_bundled(app: AppHandle, base: &'static Base) {
+    let Some(dir) = bundle_dir() else { return };
+    let source = EngineSource::with_bundle(&dir);
+    let rec = Recorder::new(&base.control, &base.journal, CONTROL);
+    let Ok(store) = EngineStore::open(&base.data.join("engines"), shipped_pins(), &source, &rec, &base.gate, &base.governor) else { return };
+    let installed = store.installed().unwrap_or_default();
+    let have_pack = |name: &str| store.installed_packs().unwrap_or_default().iter().any(|(n, _, _)| n == name);
+    let gpus = measure(None).gpus;
+    let packs: Vec<_> = shipped_packs().into_iter().filter(|p| dir.join("packs").join(&p.name).is_dir() && !have_pack(&p.name) && gpus.iter().any(|g| p.serves(&g.name))).collect();
+    let pins: Vec<_> = store.pins().iter().filter(|p| dir.join(&p.asset).is_file() && !installed.iter().any(|b| b.variant == p.variant)).cloned().collect();
+    if packs.is_empty() && pins.is_empty() {
+        return;
+    }
+    let Ok(turn) = base.instruction("Set up the engines that came with Lu") else { return };
+    let emit = |id: &str, v: Value| {
+        let key = format!("engine:{id}");
+        if v.get("finished").is_some() || v.get("error").is_some() {
+            transfer(&key, None);
+        } else {
+            let mut t = v.clone();
+            t["kind"] = json!("engine");
+            t["id"] = json!(id);
+            transfer(&key, Some(t));
+        }
+        let _ = app.emit("engine-event", v);
+    };
+    for pack in &packs {
+        let id = pack.for_variant.as_str();
+        emit(id, json!({"id": id, "stage": "Setting up GPU support files", "done": 0, "total": 1}));
+        let mut last = 101;
+        let r = store.install_pack_from_folder(&new_id('c'), &turn, pack, &dir.join("packs").join(&pack.name), &mut |d, t| {
+            let pct = d * 100 / t.max(1);
+            if pct != last {
+                last = pct;
+                emit(id, json!({"id": id, "stage": "Setting up GPU support files", "done": d, "total": t}));
+            }
+        });
+        if let Err(e) = r {
+            emit(id, json!({"id": id, "error": format!("The GPU support files that came with Lu could not be set up: {e}")}));
+        }
+    }
+    // CPU first: it always works, so Lu can load a model even if a GPU build does not.
+    let order = |v: Variant| match v {
+        Variant::Cpu => 0,
+        Variant::Vulkan => 1,
+        Variant::Rocm => 2,
+    };
+    let mut pins = pins;
+    pins.sort_by_key(|p| order(p.variant));
+    for pin in &pins {
+        let id = pin.variant.as_str();
+        emit(id, json!({"id": id, "stage": "Setting up", "done": 0, "total": 1}));
+        match store.install(&new_id('c'), &turn, pin, true, &AtomicBool::new(false), &mut |_, _| {}) {
+            Ok(_) => emit(id, json!({"id": id, "finished": true})),
+            Err(e) => emit(id, json!({"id": id, "error": format!("The {} engine that came with Lu could not be set up here: {e}", id)})),
+        }
+    }
 }
 
 // ---------------------------------------------------------------- model thread
@@ -1053,7 +1140,7 @@ async fn open_window(handle: AppHandle, kind: String, tab: Option<String>) -> R<
         Some(t) => format!("{file}#{t}"),
         None => file.to_owned(),
     };
-    WebviewWindowBuilder::new(&handle, label, WebviewUrl::App(url.into())).title(title).inner_size(w, h).min_inner_size(640.0, 420.0).build().map_err(s)?;
+    webview_data(WebviewWindowBuilder::new(&handle, label, WebviewUrl::App(url.into()))).title(title).inner_size(w, h).min_inner_size(640.0, 420.0).build().map_err(s)?;
     Ok(())
 }
 
@@ -1074,7 +1161,9 @@ fn main() {
         .setup(move |app| {
             let handle = app.handle().clone();
             thread::spawn(move || model_thread(handle, base, thread_status, rx));
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into())).title("Lu").inner_size(1180.0, 760.0).min_inner_size(720.0, 480.0).build()?;
+            let setup_handle = app.handle().clone();
+            thread::spawn(move || setup_bundled(setup_handle, base));
+            webview_data(WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))).title("Lu").inner_size(1180.0, 760.0).min_inner_size(720.0, 480.0).build()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
