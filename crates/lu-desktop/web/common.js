@@ -1,3 +1,4 @@
+import { parseChart, drawChart, drawTable } from "./charts.js";
 // Shared by Lu's windows: commands, events, theme, menus, dialogs, and a
 // safe formatter for replies (text nodes only; model output is never HTML).
 
@@ -143,11 +144,33 @@ export function renderReply(text, into) {
     const line = lines[i];
     if (line.startsWith("```")) {
       flush(); list = null;
+      const lang = line.slice(3).trim().toLowerCase();
       const code = [];
       i++;
       while (i < lines.length && !lines[i].startsWith("```")) code.push(lines[i++]);
-      into.append(el("pre", {}, el("code", { text: code.join("\n") })));
+      const closed = i < lines.length;
       i++;
+      if (lang === "chart") {
+        // Still streaming: a placeholder, not half-written JSON.
+        if (!closed) { into.append(el("div", { class: "chart chart-wait", text: "Drawing a chart…" })); continue; }
+        try { into.append(drawChart(parseChart(code.join("\n")))); }
+        catch (e) {
+          into.append(el("div", { class: "note-line", text: `This chart could not be drawn: ${e.message}.` }));
+          into.append(el("pre", {}, el("code", { text: code.join("\n") })));
+        }
+        continue;
+      }
+      into.append(el("pre", {}, el("code", { text: code.join("\n") })));
+      continue;
+    }
+    // A markdown table: a header row, a |---| row, then rows.
+    if (/^\s*\|.*\|\s*$/.test(line) && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1] || "")) {
+      flush(); list = null;
+      const rows = [];
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(lines[i++]);
+      const t = drawTable(rows);
+      t.paint(inline);
+      into.append(t.node);
       continue;
     }
     const h = line.match(/^(#{1,3})\s+(.*)/);
