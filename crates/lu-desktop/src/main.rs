@@ -29,6 +29,7 @@ use catalog::{find_gguf, sibling_projector, Catalog, ModelEntry, ModelSettings};
 use lu_core::{
     ansf::AnsfStore,
     ansf_live_chat::{LiveEvent, LiveKind},
+    dx::{self, DxStore, ExactAnswer, Finding, Sources},
     chat::{folders_named, image_data_url, is_image, new_id, ChatConfig, ChatEvent, ChatLoop, DEFAULT_SYSTEM_PROMPT},
     conversations::{ConversationLibrary, SearchHit},
     engines::{load_with_fallback, reasoning_levels, shipped_packs, shipped_pins, EngineSource, EngineStore, LlamaServer, RunSettings, Variant},
@@ -61,6 +62,8 @@ struct Base {
     source: EngineSource,
     /// Where the user's clicks are recorded as their instructions.
     control: AnsfStore,
+    /// DX: diagnostics and benchmark records, exports in <data>/dx.
+    dx: DxStore,
 }
 const CONTROL: &str = "c-00000000000000000000000000000001";
 
@@ -82,6 +85,7 @@ impl Base {
             hub: Hub::official(),
             source: EngineSource::github(),
             control,
+            dx: DxStore::open(data)?,
             data: data.to_path_buf(),
         })
     }
@@ -144,6 +148,8 @@ enum Job {
     Load(i64, bool),
     Unload,
     Send { chat: String, text: String, attachments: Vec<String>, reasoning: Option<String> },
+    /// A benchmark on the loaded model: `speed` or `memory`.
+    Bench(String),
 }
 
 /// Downloads and engine installs in progress, so any window or tab that
@@ -332,6 +338,37 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                         set_status(&app, &status, |s| *s = ModelStatus { state: "error".into(), model: Some(model.name.clone()), message: Some(msg), ..Default::default() });
                     }
                 }
+            }
+            Job::Bench(kind) => {
+                let Some((server, model)) = engine.as_mut() else {
+                    let _ = app.emit("dx-event", json!({"kind": kind, "error": "Load a model first."}));
+                    continue;
+                };
+                set_status(&app, &status, |s| s.busy = true);
+                let label = model.name.clone();
+                let result = if kind == "memory" {
+                    let scratch = base.data.join("dx-scratch");
+                    let _ = std::fs::create_dir_all(&scratch);
+                    base.dx.memory_benchmark(server, &model.path, &dx::memory_set(), &ExactAnswer, 6, &scratch).map(|r| {
+                        json!({"run": r.id, "model": label, "backend": r.backend,
+                            "arms": r.arms.iter().map(|(a, c, j, t)| json!({"arm": a, "correct": c, "judged": j, "total": t})).collect::<Vec<_>>(),
+                            "results": r.results.iter().map(|(a, x)| json!({"arm": a, "task": x.task, "correct": x.correct, "answer": x.answer.chars().take(400).collect::<String>()})).collect::<Vec<_>>()})
+                    })
+                } else {
+                    base.dx.benchmark(server, &model.path, &dx::starter_tasks(), &ExactAnswer, 1024).map(|r| {
+                        let (c, j, t) = r.score();
+                        json!({"run": r.id, "model": label, "backend": r.backend, "correct": c, "judged": j, "total": t, "speed": r.mean_speed(),
+                            "results": r.results.iter().map(|x| json!({"task": x.task, "kind": x.kind, "correct": x.correct, "speed": x.tokens_per_second, "answer": x.answer.chars().take(400).collect::<String>()})).collect::<Vec<_>>()})
+                    })
+                };
+                set_status(&app, &status, |s| s.busy = false);
+                let _ = app.emit("dx-event", match result {
+                    Ok(mut v) => {
+                        v["kind"] = json!(kind);
+                        v
+                    }
+                    Err(e) => json!({"kind": kind, "error": e}),
+                });
             }
             Job::Send { chat, text, attachments, reasoning } => {
                 if let Ok(mut w) = WAITING.lock() {
@@ -901,6 +938,49 @@ fn rollback_engine(app: State<App>, variant: String) -> R<String> {
 fn app_settings(app: State<App>) -> R<Value> {
     Ok(json!({"workspace": app.base.workspace().to_string_lossy(), "data": app.base.data.to_string_lossy(), "allowed": app.base.catalog.allowed_folders()}))
 }
+// ---------------------------------------------------------------- commands: DX
+
+fn finding_json(f: &Finding) -> Value {
+    json!({"check": f.check, "severity": f.severity.as_str(), "summary": f.summary, "cause": f.cause, "fix": f.fix, "evidence": f.evidence, "private": f.private_detail})
+}
+/// Read-only checks of Lu's own records (costs nothing, changes nothing).
+#[tauri::command]
+async fn dx_check(app: State<'_, App>) -> R<Value> {
+    let base = app.base;
+    let rec = Recorder::new(&base.control, &base.journal, CONTROL);
+    let store = EngineStore::open(&base.data.join("engines"), shipped_pins(), &base.source, &rec, &base.gate, &base.governor).map_err(s)?;
+    let findings = dx::passive_checks(&Sources { engines: Some(&store), governor: Some(&base.governor), journal: Some(&base.journal), gate: Some((&base.gate, CONTROL)), environment: Some(&base.environment) });
+    let run = base.dx.record("passive", &findings)?;
+    Ok(json!({"run": run, "findings": findings.iter().map(finding_json).collect::<Vec<_>>()}))
+}
+/// Lu's own tools on a scratch folder (the user's files are not touched).
+#[tauri::command]
+async fn dx_self_test(app: State<'_, App>) -> R<Value> {
+    let base = app.base;
+    let scratch = base.data.join("dx-scratch");
+    std::fs::create_dir_all(&scratch).map_err(s)?;
+    let findings = dx::tool_self_test(&scratch);
+    let run = base.dx.record("active", &findings)?;
+    Ok(json!({"run": run, "findings": findings.iter().map(finding_json).collect::<Vec<_>>()}))
+}
+/// Start a benchmark on the loaded model; the result arrives as `dx-event`.
+#[tauri::command]
+fn dx_benchmark(app: State<App>, kind: String) -> R<()> {
+    if !matches!(kind.as_str(), "speed" | "memory") {
+        return Err("unknown benchmark".into());
+    }
+    app.base.instruction(&format!("Run the {kind} benchmark"))?;
+    app.jobs.lock().map_err(s)?.send(Job::Bench(kind)).map_err(s)
+}
+/// Write a sanitized report of a run into <data>/dx and show the folder.
+#[tauri::command]
+fn dx_export(app: State<App>, run: i64) -> R<String> {
+    let (txt, _json) = app.base.dx.export(run)?;
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer.exe").arg("/select,").arg(&txt).spawn();
+    Ok(txt.to_string_lossy().into_owned())
+}
+
 /// Open a web address in the user's own browser.
 #[tauri::command]
 fn open_link(url: String) -> R<()> {
@@ -958,6 +1038,7 @@ async fn open_window(handle: AppHandle, kind: String, tab: Option<String>) -> R<
     let (label, title, file, w, h) = match kind.as_str() {
         "models" => ("models", "Lu · Models", "models.html", 980.0, 680.0),
         "manager" => ("manager", "Lu · Conversations", "manager.html", 900.0, 640.0),
+        "diagnostics" => ("diagnostics", "Lu · Diagnostics", "diagnostics.html", 900.0, 680.0),
         _ => return Err("unknown window".into()),
     };
     if let Some(win) = handle.get_webview_window(label) {
@@ -998,7 +1079,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             library, new_chat, rename_chat, delete_chat, new_folder, rename_folder, delete_folder, move_chat, search_chats, chat_messages, trash, restore_chat, erase_chat, send_message, chat_live, stop_chat, answer_approval,
             model_status, load_model, unload_model, models, save_model_settings, rename_model, remove_model, delete_model, import_model, scan_models,
-            hf_search, hf_files, hf_download, engines, install_engine, rollback_engine, app_settings, set_workspace, open_window, open_link, transfers, download_history, clear_download_history, allow_folder, forget_folder
+            hf_search, hf_files, hf_download, engines, install_engine, rollback_engine, app_settings, set_workspace, open_window, open_link, dx_check, dx_self_test, dx_benchmark, dx_export, transfers, download_history, clear_download_history, allow_folder, forget_folder
         ])
         .run(tauri::generate_context!())
         .expect("Lu failed to start");

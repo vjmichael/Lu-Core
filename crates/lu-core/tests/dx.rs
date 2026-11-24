@@ -308,3 +308,84 @@ fn benchmarks_keep_raw_answers_and_a_rescore_never_replaces_the_original() {
     assert_eq!(ExactAnswer.check(t, "about a million"), None);
     let _ = server.unload();
 }
+
+#[test]
+fn the_tool_self_test_passes_and_leaves_nothing_behind() {
+    let dir = base("selftest");
+    let findings = dx::tool_self_test(&dir);
+    for f in &findings {
+        assert_eq!(f.severity, Severity::Ok, "{}: {} {:?} {:?}", f.check, f.summary, f.cause, f.private_detail);
+    }
+    let checks: Vec<&str> = findings.iter().map(|f| f.check.as_str()).collect();
+    for c in ["selftest.write_read", "selftest.snapshot_restore", "selftest.edit", "selftest.trash", "selftest.archive", "selftest.command", "selftest.scope"] {
+        assert!(checks.contains(&c), "{c} missing from {checks:?}");
+    }
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "the scratch folder is removed");
+}
+
+#[test]
+fn the_memory_benchmark_compares_three_arms() {
+    let dir = base("membench");
+    let build = test_build(&dir, Variant::Cpu);
+    let model = dir.join("tiny-Q4_K_M.gguf");
+    fs::write(&model, gguf::minimal("qwen3", "Tiny", 2048, 64)).unwrap();
+    let mut server = LlamaServer::new(build, RunSettings { load_timeout: Duration::from_secs(30), ..RunSettings::default() }, &dir.join("logs"));
+    server.load(&model.to_string_lossy()).unwrap();
+    let store = DxStore::open(&dir).unwrap();
+    // Facts told early, filler after; the test engine answers "ASK key" from
+    // any message holding "FACT key=value".
+    let mut history = vec![("Note: FACT petname=Biscuit".to_owned(), "Noted.".to_owned()), ("Note: FACT harbor=8443".to_owned(), "Noted.".to_owned())];
+    for i in 0..10 {
+        history.push((format!("Unrelated question number {i}"), format!("Unrelated answer {i}")));
+    }
+    let t = |id: &str, prompt: &str, expected: &str| Task { id: id.into(), kind: "memory".into(), prompt: prompt.into(), expected: expected.into() };
+    let set = dx::MemorySet {
+        history,
+        questions: vec![t("pet", "ASK petname please", "Biscuit"), t("port", "ASK harbor please", "8443"), t("control", "ASK sum given FACT sum=144 here", "144")],
+    };
+    let scratch = dir.join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    let run = store.memory_benchmark(&mut server, &model.to_string_lossy(), &set, &ExactAnswer, 6, &scratch).unwrap();
+    let arm = |name: &str| run.arms.iter().find(|a| a.0 == name).cloned().unwrap();
+    assert_eq!(arm("none"), ("none".into(), 1, 3, 3), "only the control question without history");
+    assert_eq!(arm("recent"), ("recent".into(), 1, 3, 3), "the facts are older than the recent window");
+    assert_eq!(arm("memory"), ("memory".into(), 3, 3, 3), "Lu's memory brings the old facts back");
+    // Stored like any benchmark: raw answers kept, nine original scores.
+    let scores = store.scores(run.id).unwrap();
+    assert_eq!(scores.len(), 9);
+    assert!(scores.iter().all(|s| s.3), "all original");
+    assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0, "throwaway records removed");
+    let _ = server.unload();
+}
+
+/// Owner PC: the memory benchmark on the owner's real model (ROCm).
+#[test]
+#[ignore]
+fn owner_memory_benchmark() {
+    use lu_core::engines::{load_with_fallback, shipped_pins};
+    let data = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("Lu-Dev");
+    let dir = base("owner-mem");
+    let book = AnsfStore::open(&dir.join("book.sqlite")).unwrap();
+    book.create_session("c-1", "lu", "bench").unwrap();
+    book.start_chapter("c-1", "s").unwrap();
+    let journal = EffectJournal::open(&dir.join("effects.sqlite")).unwrap();
+    let gate = OriginGate::open(&dir.join("origin.sqlite")).unwrap();
+    let governor = Governor::open(&dir.join("resources.sqlite")).unwrap();
+    let rec = Recorder::new(&book, &journal, "c-1");
+    let source = EngineSource::github();
+    let engines = EngineStore::open(&data.join("engines"), shipped_pins(), &source, &rec, &gate, &governor).unwrap();
+    let model = r"C:\Users\UserMN4312\.lmstudio\models\lmstudio-community\Qwen3.8-27B-GGUF\Qwen3.8-27B-Q4_K_M.gguf";
+    let (mut server, _) = load_with_fallback(&engines, model, true, &RunSettings { context: 16384, ..RunSettings::default() }, &dir.join("logs")).unwrap();
+    let store = DxStore::open(&dir).unwrap();
+    let scratch = dir.join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+    let run = store.memory_benchmark(&mut server, model, &dx::memory_set(), &ExactAnswer, 6, &scratch).unwrap();
+    println!("backend {}", run.backend);
+    for a in &run.arms {
+        println!("{a:?}");
+    }
+    for (arm, r) in &run.results {
+        println!("{arm:7} {:13} {:?}  {:?}", r.task, r.correct, r.answer.lines().last().unwrap_or(""));
+    }
+    let _ = server.unload();
+}

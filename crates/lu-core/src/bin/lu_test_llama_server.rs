@@ -170,6 +170,15 @@ fn chat(s: &mut std::net::TcpStream, body: &[u8]) {
             send(s, serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":part}}]},"finish_reason":null}]}));
         }
         send(s, finish("tool_calls"));
+    } else if let Some(key) = content.split("ASK ").nth(1).and_then(|r| r.split_whitespace().next()) {
+        // Memory test: answer from any message that holds "FACT <key>=<value>".
+        let all: String = messages.iter().filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n");
+        let needle = format!("FACT {key}=");
+        let value = all.split(&needle).nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("unknown");
+        for piece in ["I think.\n", "ANSWER: ", value] {
+            send(s, text_chunk(piece));
+        }
+        send(s, finish("stop"));
     } else if content.contains("LOOP") {
         for _ in 0..400 {
             send(s, text_chunk("I will keep saying this same sentence. "));

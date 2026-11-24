@@ -1,3 +1,19 @@
+.findings { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.finding { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--seam); border-radius: 12px; background: var(--panel-2); cursor: pointer; }
+.finding .sev { width: 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; flex: none; font-size: 12px; }
+.sev-ok .sev { background: color-mix(in srgb, var(--c3) 18%, transparent); color: var(--c3); }
+.sev-problem .sev { background: color-mix(in srgb, var(--c4) 18%, transparent); color: var(--c4); }
+.sev-not-enough-evidence .sev { background: color-mix(in srgb, var(--c2) 18%, transparent); color: var(--c2); }
+.finding-more { margin: -2px 0 6px 46px; font-size: 13px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+.finding-more ul { margin: 4px 0; padding-left: 18px; }
+.mono { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+.row-between { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 6px 0; }
+.row-between h3 { margin: 0; font-size: 15px; }
+.bars { display: flex; flex-direction: column; gap: 8px; margin: 12px 0 6px; max-width: 560px; }
+.bar-row { display: grid; grid-template-columns: 170px 1fr 70px; align-items: center; gap: 12px; font-size: 13px; }
+.bar { display: block; height: 10px; background: var(--panel-3); border-radius: 6px; overflow: hidden; }
+.bar i { display: block; height: 10px; background: var(--c1); border-radius: 6px; }
+.bar-num { color: var(--muted); text-align: right; }
 a.link { color: var(--c1); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--c1) 35%, transparent); cursor: pointer; overflow-wrap: anywhere; }
 a.link:hover { border-bottom-color: var(--c1); }
 .media { margin: 6px 0 14px; max-width: 100%; }

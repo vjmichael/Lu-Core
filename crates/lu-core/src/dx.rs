@@ -867,3 +867,334 @@ impl DxStore {
         Ok((txt_path, json_path))
     }
 }
+
+// ---------------------------------------------------------------- tool self-test
+
+/// Run Lu's own basic tools, through the same checked layer the model uses
+/// (origin gate, staged writes, snapshots, trash), on a scratch folder under
+/// `scratch_root` with its own throwaway record, gate and snapshots. The
+/// user's files and conversations are never touched. Active: the user
+/// starts it. The scratch folder is removed afterwards.
+pub fn tool_self_test(scratch_root: &Path) -> Vec<Finding> {
+    use crate::ansf::AnsfStore;
+    use crate::ansf_live_chat::{LiveEvent, LiveKind};
+    use crate::chat::new_id;
+    use crate::files::{Call, Content, FileAccess, FileError, ReadResult, WorkingScope, WriteMode, WriteRequest};
+    use crate::recorder::Recorder;
+    use crate::runner::{CancelToken, CommandRunner, RunRequest};
+    use crate::snapshot::{SnapshotLimits, SnapshotStore};
+    use std::io::Write as _;
+
+    let dir = scratch_root.join(format!("lu-selftest-{}-{}", std::process::id(), now_secs()));
+    let work = dir.join("work");
+    let setup = (|| -> Result<_, String> {
+        fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        let work = fs::canonicalize(&work).map_err(|e| e.to_string())?;
+        let work = PathBuf::from(work.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
+        let book = AnsfStore::open(&dir.join("book.sqlite")).map_err(|e| format!("{e:?}"))?;
+        let journal = EffectJournal::open(&dir.join("effects.sqlite")).map_err(|e| format!("{e:?}"))?;
+        let gate = OriginGate::open(&dir.join("origin.sqlite")).map_err(|e| format!("{e:?}"))?;
+        let snapshots = SnapshotStore::open(&dir.join("snapshots")).map_err(|e| format!("{e:?}"))?;
+        Ok((work, book, journal, gate, snapshots))
+    })();
+    let (work, book, journal, gate, snapshots) = match setup {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&dir);
+            return vec![Finding::new("selftest.setup", Severity::Problem, "The self-test could not set up its scratch folder.").cause(e).fix("Check that Lu's data folder is writable and has free space.")];
+        }
+    };
+    let session = new_id('c');
+    let turn = new_id('g');
+    let mut out = Vec::new();
+    let ok_setup = book.create_session(&session, "lu", "Self-test").is_ok()
+        && book.start_chapter(&session, "Self-test").is_ok()
+        && book
+            .append_host_chat_event(&session, &LiveEvent { event_id: new_id('e'), kind: LiveKind::User, text: format!("Lu self-test in {}", work.display()), user_turn_id: Some(turn.clone()), legacy_turn_id: None, generation_id: None })
+            .is_ok();
+    let rec = Recorder::new(&book, &journal, session.as_str());
+    let files = match WorkingScope::new(std::slice::from_ref(&work)) {
+        Ok(scope) => FileAccess::new(&rec, &snapshots, &gate, scope, SnapshotLimits::default()),
+        Err(e) => {
+            drop(rec);
+            let _ = fs::remove_dir_all(&dir);
+            return vec![Finding::new("selftest.setup", Severity::Problem, "The self-test could not set up its working folder.").cause(format!("{e:?}"))];
+        }
+    };
+    if !ok_setup {
+        out.push(Finding::new("selftest.setup", Severity::Problem, "The self-test could not record its own instruction.").fix("Run the passive checks; Lu's record store may be damaged."));
+    }
+    let mut n = 0;
+    let mut call = || {
+        n += 1;
+        Call { call_id: format!("selftest-{n}"), turn_id: turn.clone() }
+    };
+    let mut step = |check: &str, what: &str, r: Result<(), String>| {
+        out.push(match r {
+            Ok(()) => Finding::new(check, Severity::Ok, format!("{what}: works.")),
+            Err(e) => Finding::new(check, Severity::Problem, format!("{what}: failed.")).cause(e.clone()).fix("Export this report and look at the cause; Lu's tools may not work in chats either.").private(e),
+        });
+    };
+    let text_of = |r: Result<ReadResult, FileError>| -> Result<String, String> {
+        match r.map_err(|e| format!("{e:?}"))? {
+            ReadResult::Text { content, .. } => Ok(content),
+            other => Err(format!("read back as something else: {other:?}")),
+        }
+    };
+    let note = work.join("note.txt");
+
+    // 1. Write a new file, read it back.
+    let r = files
+        .write(&call(), &WriteRequest { path: note.clone(), content: Content::Text("first version\nline two\n".into()), mode: WriteMode::CreateNew, intended_lines: None })
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|_| text_of(files.read(&call(), &note)))
+        .and_then(|t| if t == "first version\nline two\n" { Ok(()) } else { Err(format!("read back {t:?}")) });
+    step("selftest.write_read", "Writing a file and reading it back", r);
+
+    // 2. Replace it; the previous version is kept and restores exactly.
+    let r = (|| -> Result<(), String> {
+        let receipt = files
+            .write(&call(), &WriteRequest { path: note.clone(), content: Content::Text("second version\n".into()), mode: WriteMode::CreateOrReplace, intended_lines: None })
+            .map_err(|e| format!("{e:?}"))?;
+        let snap = receipt.snapshot.ok_or("no copy of the previous version was kept")?;
+        let id: i64 = snap.trim_start_matches("snap:").parse().map_err(|_| format!("unexpected snapshot reference {snap}"))?;
+        let rel = note.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        snapshots
+            .restore(id, &rel)
+            .or_else(|_| snapshots.restore(id, &note.to_string_lossy()))
+            .map_err(|e| format!("restore: {e:?}"))?;
+        let t = fs::read_to_string(&note).map_err(|e| e.to_string())?;
+        if t == "first version\nline two\n" { Ok(()) } else { Err(format!("after restore the file holds {t:?}")) }
+    })();
+    step("selftest.snapshot_restore", "Keeping the previous version and restoring it", r);
+
+    // 3. Edit one line.
+    let r = files
+        .edit_lines(&call(), &note, 2, 2, "line 2 (edited)", None)
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|_| fs::read_to_string(&note).map_err(|e| e.to_string()))
+        .and_then(|t| if t.lines().nth(1) == Some("line 2 (edited)") && t.starts_with("first version") { Ok(()) } else { Err(format!("after the edit the file holds {t:?}")) });
+    step("selftest.edit", "Editing one line of a file", r);
+
+    // 4. Delete to the trash and restore.
+    let r = files
+        .trash(&call(), &note)
+        .map_err(|e| format!("{e:?}"))
+        .and_then(|entry| if note.exists() { Err("the file is still there after deleting".into()) } else { Ok(entry) })
+        .and_then(|entry| files.restore_from_trash(&call(), &entry).map_err(|e| format!("{e:?}")))
+        .and_then(|_| if note.exists() { Ok(()) } else { Err("the file did not come back from the trash".into()) });
+    step("selftest.trash", "Deleting to the trash and restoring", r);
+
+    // 5. Look inside an archive and extract it.
+    let r = (|| -> Result<(), String> {
+        let zip_path = work.join("pack.zip");
+        {
+            let f = fs::File::create(&zip_path).map_err(|e| e.to_string())?;
+            let mut z = zip::ZipWriter::new(f);
+            z.start_file("inside/hello.txt", zip::write::SimpleFileOptions::default()).map_err(|e| e.to_string())?;
+            z.write_all(b"hello from the archive").map_err(|e| e.to_string())?;
+            z.finish().map_err(|e| e.to_string())?;
+        }
+        let listing = files.list_archive(&call(), &zip_path).map_err(|e| format!("{e:?}"))?;
+        if !format!("{listing:?}").contains("hello.txt") {
+            return Err(format!("the listing does not show the file: {listing:?}"));
+        }
+        let dest = work.join("unpacked");
+        files.extract_archive(&call(), &zip_path, &dest, &crate::archive::ArchiveLimits::default()).map_err(|e| format!("{e:?}"))?;
+        let t = fs::read_to_string(dest.join("inside").join("hello.txt")).map_err(|e| format!("extracted file: {e}"))?;
+        if t == "hello from the archive" { Ok(()) } else { Err(format!("extracted {t:?}")) }
+    })();
+    step("selftest.archive", "Listing and extracting an archive", r);
+
+    // 6. Run a command and read its output.
+    let r = (|| -> Result<(), String> {
+        let runner = CommandRunner::new(&rec, &snapshots, &gate, SnapshotLimits::default(), &dir.join("runner")).map_err(|e| format!("{e:?}"))?;
+        let c = call();
+        let cmd = if cfg!(windows) { "Write-Output lu-selftest-ok" } else { "echo lu-selftest-ok" };
+        let res = runner
+            .run(&RunRequest { call_id: c.call_id, turn_id: c.turn_id, command: cmd.into(), cwd: work.clone(), timeout: std::time::Duration::from_secs(60), snapshot: false }, &CancelToken::default())
+            .map_err(|e| format!("{e:?}"))?;
+        match (res.exit_code, res.output_for_model.contains("lu-selftest-ok")) {
+            (Some(0), true) => Ok(()),
+            (code, _) => Err(format!("exit code {code:?}, output {:?}", res.output_for_model.chars().take(200).collect::<String>())),
+        }
+    })();
+    step("selftest.command", "Running a command", r);
+
+    // 7. A write outside the allowed folder is held, not done.
+    let outside = dir.join("outside.txt");
+    let r = match files.write(&call(), &WriteRequest { path: outside.clone(), content: Content::Text("x".into()), mode: WriteMode::CreateNew, intended_lines: None }) {
+        Err(FileError::Held { .. }) if !outside.exists() => Ok(()),
+        Err(e) => Err(format!("refused for another reason: {e:?}")),
+        Ok(_) => Err("the write outside the allowed folder went through".into()),
+    };
+    step("selftest.scope", "Holding a write outside the allowed folders", r);
+
+    drop(files);
+    drop(rec);
+    drop(book);
+    drop(journal);
+    drop(gate);
+    drop(snapshots);
+    let _ = fs::remove_dir_all(&dir);
+    out
+}
+
+// ---------------------------------------------------------------- memory benchmark
+
+/// A conversation to remember and questions about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySet {
+    /// Earlier (user, assistant) exchanges, oldest first. The facts sit in
+    /// the first ones; later filler pushes them out of the recent window.
+    pub history: Vec<(String, String)>,
+    /// Questions with known answers (some about the facts, one control).
+    pub questions: Vec<Task>,
+}
+
+/// The built-in set: four facts told early, twelve unrelated exchanges, and
+/// questions about the facts plus one control question memory cannot help.
+pub fn memory_set() -> MemorySet {
+    let mut history = vec![
+        ("By the way, my dog's name is Biscuit.".to_owned(), "Biscuit is a lovely name. Noted.".to_owned()),
+        ("The NVP project deadline is March 14.".to_owned(), "Got it: NVP is due on March 14.".to_owned()),
+        ("Remember that the staging server listens on port 8443.".to_owned(), "Noted: staging uses port 8443.".to_owned()),
+        ("For charts I always want the color teal.".to_owned(), "Understood: teal for charts.".to_owned()),
+    ];
+    let filler = [
+        ("What is the capital of Japan?", "Tokyo."),
+        ("How many legs does a spider have?", "Eight."),
+        ("Give me a synonym for quick.", "Fast."),
+        ("What is 15 plus 27?", "42."),
+        ("Which planet is known as the red planet?", "Mars."),
+        ("How many days are in a leap year?", "366."),
+        ("What language is spoken in Brazil?", "Portuguese."),
+        ("Name a primary color.", "Blue."),
+        ("What is the boiling point of water in Celsius?", "100 degrees."),
+        ("How many minutes are in two hours?", "120."),
+        ("What is the opposite of ancient?", "Modern."),
+        ("Spell the word cat backwards.", "tac."),
+    ];
+    history.extend(filler.iter().map(|(a, b)| (a.to_string(), b.to_string())));
+    let t = |id: &str, prompt: &str, expected: &str| Task { id: id.into(), kind: "memory".into(), prompt: format!("{prompt}\nIf you do not know, say so. End with one line: ANSWER: <the answer>"), expected: expected.into() };
+    MemorySet {
+        history,
+        questions: vec![
+            t("mem-dog", "What is my dog's name?", "Biscuit"),
+            t("mem-deadline", "When is the NVP project deadline? Give the month and day.", "March 14"),
+            t("mem-port", "Which port does the staging server listen on?", "8443"),
+            t("mem-color", "Which color do I want for charts?", "teal"),
+            t("mem-control", "What is 12 multiplied by 12?", "144"),
+        ],
+    }
+}
+
+/// The three ways the model is asked.
+pub const MEMORY_ARMS: [&str; 3] = ["none", "recent", "memory"];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryBenchRun {
+    pub id: i64,
+    pub model: String,
+    pub backend: String,
+    /// Per arm: (arm, correct, judged, total).
+    pub arms: Vec<(String, usize, usize, usize)>,
+    pub results: Vec<(String, TaskResult)>,
+}
+
+impl DxStore {
+    /// Memory, three arms: each question is asked with no earlier
+    /// conversation ("none"), with the last `recent` messages only
+    /// ("recent"), and with those plus Lu's memory block ("memory"), which
+    /// brings back older messages relevant to the question. Each question
+    /// gets its own throwaway record under `scratch_root`; the user's
+    /// conversations are not used. Scoring is fixed before the run; raw
+    /// answers are kept. Active: the user starts it.
+    pub fn memory_benchmark(&self, server: &mut LlamaServer, model: &str, set: &MemorySet, checker: &dyn Checker, recent: usize, scratch_root: &Path) -> Result<MemoryBenchRun, String> {
+        use crate::ansf::AnsfStore;
+        use crate::ansf_live_chat::{LiveEvent, LiveKind};
+        use crate::chat::new_id;
+        use crate::engines::{ChatMessage, ChatOptions};
+        use crate::memory::{MemoryInjector, DEFAULT_BUDGET_CHARS};
+        use crate::recorder::Recorder;
+
+        let backend = format!("{} {}", server.build.variant.as_str(), server.build.version);
+        let checker_name = checker.name();
+        let system = "You are a helpful assistant. Answer briefly.";
+        let options = ChatOptions { max_tokens: 1024, temperature: Some(0.0), top_p: None, reasoning: Some("off") };
+        let mut results: Vec<(String, TaskResult)> = Vec::new();
+        for q in &set.questions {
+            // A fresh record holding the earlier conversation, then the question.
+            let dir = scratch_root.join(format!("lu-membench-{}-{}", std::process::id(), new_id('x')));
+            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let made = (|| -> Result<Vec<(String, TaskResult)>, String> {
+                let book = AnsfStore::open(&dir.join("book.sqlite")).map_err(|e| format!("{e:?}"))?;
+                let journal = EffectJournal::open(&dir.join("effects.sqlite")).map_err(|e| format!("{e:?}"))?;
+                let session = new_id('c');
+                book.create_session(&session, "lu", "Memory benchmark").map_err(|e| format!("{e:?}"))?;
+                book.start_chapter(&session, "Benchmark").map_err(|e| format!("{e:?}"))?;
+                let rec = Recorder::new(&book, &journal, session.as_str());
+                let mut injector = MemoryInjector::new(&rec).map_err(|e| format!("{e:?}"))?;
+                injector.recent_messages = recent;
+                let user = |text: &str, turn: &str| {
+                    book.append_host_chat_event(&session, &LiveEvent { event_id: new_id('e'), kind: LiveKind::User, text: text.into(), user_turn_id: Some(turn.into()), legacy_turn_id: None, generation_id: None }).map_err(|e| format!("{e:?}"))
+                };
+                for (u, a) in &set.history {
+                    user(u, &new_id('g'))?;
+                    injector.save_answer(&new_id('e'), a).map_err(|e| format!("{e:?}"))?;
+                }
+                // The recent window, taken before the question is added.
+                let window: Vec<ChatMessage> = book
+                    .recent_context_entries(&session, recent.clamp(1, 128))
+                    .map_err(|e| format!("{e:?}"))?
+                    .into_iter()
+                    .map(|e| ChatMessage::new(if e.role == "user" { "user" } else { "assistant" }, e.content))
+                    .collect();
+                let turn = new_id('g');
+                user(&q.prompt, &turn)?;
+                let block = injector.build(&turn, &[], DEFAULT_BUDGET_CHARS).map_err(|e| format!("{e:?}"))?;
+                let mut out = Vec::new();
+                for arm in MEMORY_ARMS {
+                    let mut sys = system.to_owned();
+                    if arm == "memory" && !block.text.is_empty() {
+                        sys.push_str("\n\n");
+                        sys.push_str(&block.text);
+                    }
+                    let mut messages = vec![ChatMessage::new("system", sys)];
+                    if arm != "none" {
+                        messages.extend(window.iter().cloned());
+                    }
+                    messages.push(ChatMessage::new("user", q.prompt.clone()));
+                    let (answer, tps) = match server.chat(&messages, &[], &options, &mut |_| {}) {
+                        Ok(r) => (r.content, r.tokens_per_second),
+                        Err(e) => (format!("[no answer: {e}]"), None),
+                    };
+                    let correct = checker.check(q, &answer);
+                    out.push((arm.to_owned(), TaskResult { task: q.id.clone(), kind: format!("memory:{arm}"), answer, correct, tokens_per_second: tps }));
+                }
+                Ok(out)
+            })();
+            let _ = fs::remove_dir_all(&dir);
+            results.extend(made?);
+        }
+        let mut db = self.db()?;
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO dx_runs(kind, started_at) VALUES ('benchmark', ?1)", params![now_secs() as i64]).map_err(|e| e.to_string())?;
+        let run = tx.last_insert_rowid();
+        for (arm, r) in &results {
+            let task = format!("{}@{arm}", r.task);
+            tx.execute("INSERT INTO dx_bench_results VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![run, model_label(model), backend, task, r.kind, r.answer, r.tokens_per_second]).map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO dx_bench_scores VALUES (?1, ?2, ?3, ?4, 1, ?5)", params![run, task, checker_name, r.correct, now_secs() as i64]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        let arms = MEMORY_ARMS
+            .iter()
+            .map(|arm| {
+                let rs: Vec<&TaskResult> = results.iter().filter(|(a, _)| a == arm).map(|(_, r)| r).collect();
+                (arm.to_string(), rs.iter().filter(|r| r.correct == Some(true)).count(), rs.iter().filter(|r| r.correct.is_some()).count(), rs.len())
+            })
+            .collect();
+        Ok(MemoryBenchRun { id: run, model: model_label(model), backend, arms, results })
+    }
+}
+

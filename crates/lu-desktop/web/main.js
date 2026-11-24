@@ -515,11 +515,12 @@ $("#settings").addEventListener("click", async (e) => {
   const r = e.currentTarget.getBoundingClientRect();
   const s = await call("app_settings");
   const cur = themeChoice();
-  menu(r.left, r.top - 190, [
+  menu(r.left, r.top - 225, [
     { label: (cur === "light" ? "● " : "") + "Day", run: () => setTheme("light") },
     { label: (cur === "dark" ? "● " : "") + "Night", run: () => setTheme("dark") },
     { label: (cur === "system" ? "● " : "") + "Follow Windows", run: () => setTheme("system") },
     "-",
+    { label: "Diagnostics…", run: () => call("open_window", { kind: "diagnostics" }) },
     { label: "Work folder…", run: async () => {
       const p = await promptBox("Work folder", s.workspace, "Folder Lu may work in");
       if (p) { try { await call("set_workspace", { path: p }); toast("Lu will work in " + p); } catch (err) { toast(String(err)); } }
