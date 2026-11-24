@@ -386,6 +386,11 @@ fn real_engine_install_and_load() {
         let gpu = !lu_core::resources::measure(None).gpus.is_empty();
         let (mut server, failed) = load_with_fallback(&store, &model, gpu, &RunSettings::default(), &lu.dir.join("logs")).unwrap();
         println!("loaded on {} in {:?} ms; failed first: {failed:?}", server.build.variant.as_str(), server.load_ms());
+        println!("--- engine log: devices and offload ---");
+        for line in server.device_report() {
+            println!("  {line}");
+        }
+        println!("--- end of log extract ---");
         let c = server.complete("The capital of France is", 16).unwrap();
         println!("reply: {:?} at {:?} tokens/s", c.text, c.tokens_per_second);
     }

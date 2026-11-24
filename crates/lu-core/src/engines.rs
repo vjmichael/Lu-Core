@@ -774,6 +774,17 @@ impl LlamaServer {
     pub fn loaded_model(&self) -> Option<&str> {
         self.running.as_ref().map(|r| r.model.as_str())
     }
+    /// The engine's own log for the running model.
+    pub fn log_path(&self) -> Option<&Path> {
+        self.running.as_ref().map(|r| r.log.as_path())
+    }
+    /// Log lines about devices and GPU offload, to see where the model runs.
+    pub fn device_report(&self) -> Vec<String> {
+        let Some(path) = self.log_path() else { return Vec::new() };
+        let text = fs::read_to_string(path).unwrap_or_default();
+        let keys = ["offloaded", "device", "rocm", "hip", "vulkan", "gfx", "vram", "cpu_mapped", "rocm0", "vulkan0", "error", "warning", "fall"];
+        text.lines().filter(|l| { let l = l.to_ascii_lowercase(); keys.iter().any(|k| l.contains(k)) }).map(|l| l.trim().to_owned()).take(40).collect()
+    }
     pub fn load_ms(&self) -> Option<u64> {
         self.running.as_ref().map(|r| r.loaded_ms)
     }
