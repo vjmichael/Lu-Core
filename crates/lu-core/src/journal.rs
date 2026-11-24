@@ -235,6 +235,17 @@ impl EffectJournal {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Every UNCERTAIN effect, oldest first: (call ID, tool, workspace).
+    /// Read-only; used by diagnostics.
+    pub fn uncertain_all(&self) -> Result<Vec<(String, String, Option<String>)>, JournalError> {
+        let connection = self.connection.lock().map_err(|_| JournalError::Poisoned)?;
+        let mut stmt = connection.prepare(
+            "SELECT call_id, tool_id, workspace_id FROM lu_effects WHERE state='UNCERTAIN' ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn get(&self, call_id: &str) -> Result<Option<EffectRecord>, JournalError> {
         let connection = self.connection.lock().map_err(|_| JournalError::Poisoned)?;
         let row = connection

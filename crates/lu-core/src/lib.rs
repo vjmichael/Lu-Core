@@ -31,4 +31,5 @@ pub mod resources;
 pub mod gguf;
 pub mod hf;
 pub mod engines;
+pub mod dx;
 pub mod utilities;

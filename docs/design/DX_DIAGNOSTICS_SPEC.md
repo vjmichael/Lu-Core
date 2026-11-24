@@ -1,6 +1,6 @@
 # Lu DX — Diagnostics and Benchmarks (draft for owner review)
 
-> **Status: designed, draft.** Written on Nov 23, 2026 from the owner's request in chat and from what the old Lu-AI-GUI repository records of the earlier DX work. The original DX-00 to DX-04 specification (jan_alt, Oct 29) is no longer reachable; its decisions are reconstructed from the summaries in Lu-AI-GUI `docs/LU_CORE_DESIGN_PARITY_CP13_20261116.md` and must be confirmed by the owner. Nothing here is built yet.
+> **Status: approved by the owner on Nov 23, 2026; steps 1, 2 (except the tool self-test) and 3 (speed and task kinds) are draft source in `crates/lu-core/src/dx.rs`.** Written from the owner's request in chat and from what the old Lu-AI-GUI repository records of the earlier DX work. The original DX-00 to DX-04 specification (jan_alt, Oct 29) no longer exists (the owner deleted that fork); its decisions are reconstructed from the summaries in Lu-AI-GUI `docs/LU_CORE_DESIGN_PARITY_CP13_20261116.md`. Owner decisions: exports go to a `dx` folder in Lu's data folder; benchmarks may use Cognitum as a checker when it is connected; Lu ships the ROCm libraries it needs.
 
 ## Purpose
 
@@ -110,7 +110,8 @@ Benchmark results are evidence for the model profile only when they come from a 
 
 ## Open questions
 
-- [ ] **Confirm the reconstruction.** The original DX-00 to DX-04 text is lost; owner to confirm these rules match what was intended.
+- [x] **Confirm the reconstruction.** Owner: go ahead (Nov 23).
 - [ ] **Benchmark sets.** Which fixed task sets to start with; the owner's Cognitum tests are the default source for the first task kinds.
-- [ ] **Export destination.** A file the user saves, nothing sent anywhere. Owner to confirm.
-- [ ] **ROCm path.** Whether Lu should use AMD's HIP SDK when the owner installs it, or supply the missing rocBLAS/hipBLAS libraries itself (both MIT-licensed) from a pinned source. Until decided, DX reports the missing libraries and Lu uses Vulkan.
+- [x] **Export destination.** A `dx` folder in Lu's data folder; nothing is sent anywhere.
+- [x] **ROCm path.** Lu ships what it needs: a ROCm runtime pack (hipBLAS, rocBLAS and their kernels) built from AMD's pinned ROCm tarball, so any user runs out of the box.
+- [ ] **Benchmark sets.** A starter set of eight exact-answer tasks is built in; Cognitum can check them when connected.

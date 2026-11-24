@@ -179,6 +179,9 @@ pub struct EngineBuild {
     pub dir: PathBuf,
     pub server: PathBuf,
     pub active: bool,
+    /// What the install check found: version line and the devices the
+    /// build reported (`...; devices: ROCm0: ...`).
+    pub report: String,
 }
 
 /// A result kept for a model on a backend.
@@ -502,15 +505,15 @@ impl<'a> EngineStore<'a> {
 
     pub fn installed(&self) -> Result<Vec<EngineBuild>, EngineError> {
         let db = self.db()?;
-        let mut q = db.prepare("SELECT variant, version, dir, server, active FROM lu_engine_builds ORDER BY variant, installed_at")?;
+        let mut q = db.prepare("SELECT variant, version, dir, server, active, version_line FROM lu_engine_builds ORDER BY variant, installed_at")?;
         let rows = q.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, bool>(4)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, bool>(4)?, r.get::<_, String>(5)?))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (v, version, dir, server, active) = row?;
+            let (v, version, dir, server, active, report) = row?;
             if let Some(variant) = Variant::parse(&v) {
-                out.push(EngineBuild { variant, version, dir: PathBuf::from(dir), server: PathBuf::from(server), active });
+                out.push(EngineBuild { variant, version, dir: PathBuf::from(dir), server: PathBuf::from(server), active, report });
             }
         }
         Ok(out)
@@ -721,6 +724,33 @@ impl<'a> EngineStore<'a> {
             let (v, version, ok, load_ms, tps, note) = row?;
             if let Some(variant) = Variant::parse(&v) {
                 out.push(BackendRecord { variant, version, ok, load_ms: load_ms.map(|v| v as u64), tokens_per_second: tps, note });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The latest backend results across all models, newest first.
+    pub fn recent_results(&self, limit: usize) -> Result<Vec<(String, BackendRecord)>, EngineError> {
+        let db = self.db()?;
+        let mut q = db.prepare(
+            "SELECT model, variant, version, ok, load_ms, tokens_per_second, note FROM lu_backend_results ORDER BY seq DESC LIMIT ?1",
+        )?;
+        let rows = q.query_map(params![limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (model, v, version, ok, load_ms, tps, note) = row?;
+            if let Some(variant) = Variant::parse(&v) {
+                out.push((model, BackendRecord { variant, version, ok, load_ms: load_ms.map(|v| v as u64), tokens_per_second: tps, note }));
             }
         }
         Ok(out)
