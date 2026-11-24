@@ -843,6 +843,22 @@ fn rollback_engine(app: State<App>, variant: String) -> R<String> {
 fn app_settings(app: State<App>) -> R<Value> {
     Ok(json!({"workspace": app.base.workspace().to_string_lossy(), "data": app.base.data.to_string_lossy(), "allowed": app.base.catalog.allowed_folders()}))
 }
+/// Open a web address in the user's own browser.
+#[tauri::command]
+fn open_link(url: String) -> R<()> {
+    let u = url.trim();
+    if !(u.starts_with("https://") || u.starts_with("http://")) || u.chars().any(|c| c.is_control() || c == '"') {
+        return Err("Lu only opens web addresses (http or https).".into());
+    }
+    #[cfg(windows)]
+    let r = std::process::Command::new("explorer.exe").arg(u).spawn();
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(u).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(u).spawn();
+    r.map(|_| ()).map_err(|e| format!("Could not open the browser: {e}"))
+}
+
 #[tauri::command]
 fn transfers() -> R<Vec<Value>> {
     Ok(TRANSFERS.lock().map_err(s)?.values().cloned().collect())
@@ -924,7 +940,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             library, new_chat, rename_chat, delete_chat, new_folder, rename_folder, delete_folder, move_chat, search_chats, chat_messages, trash, restore_chat, erase_chat, send_message, chat_live, stop_chat, answer_approval,
             model_status, load_model, unload_model, models, save_model_settings, rename_model, remove_model, delete_model, import_model, scan_models,
-            hf_search, hf_files, hf_download, engines, install_engine, rollback_engine, app_settings, set_workspace, open_window, transfers, download_history, clear_download_history, allow_folder, forget_folder
+            hf_search, hf_files, hf_download, engines, install_engine, rollback_engine, app_settings, set_workspace, open_window, open_link, transfers, download_history, clear_download_history, allow_folder, forget_folder
         ])
         .run(tauri::generate_context!())
         .expect("Lu failed to start");

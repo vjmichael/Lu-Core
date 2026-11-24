@@ -1,4 +1,5 @@
 import { parseChart, drawChart, drawTable } from "./charts.js";
+import { mediaItem, embeddable, youtubeId, parseGallery, drawGallery } from "./media.js";
 // Shared by Lu's windows: commands, events, theme, menus, dialogs, and a
 // safe formatter for replies (text nodes only; model output is never HTML).
 
@@ -120,19 +121,38 @@ export function toast(text, ms = 4200) {
 
 // ---------- replies: a small Markdown subset, as DOM nodes ----------
 function inline(text, parent) {
-  // `code`, **bold**, *italic*; everything else is plain text.
-  const re = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*)/g;
+  // `code`, **bold**, *italic*, [links](https://…) and bare https:// links;
+  // everything else is plain text.
+  const re = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\)|https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"\]])/g;
   let last = 0, m;
   while ((m = re.exec(text))) {
     if (m.index > last) parent.append(text.slice(last, m.index));
     const t = m[0];
-    if (t.startsWith("`")) parent.append(el("code", { text: t.slice(1, -1) }));
+    if (t.startsWith("[")) { const m = t.match(/^\[([^\]]+)\]\((.+)\)$/); parent.append(link(m[1], m[2])); }
+    else if (/^https?:/.test(t)) parent.append(link(t, t));
+    else if (t.startsWith("`")) parent.append(el("code", { text: t.slice(1, -1) }));
     else if (t.startsWith("**")) parent.append(el("strong", { text: t.slice(2, -2) }));
     else parent.append(el("em", { text: t.slice(1, -1) }));
     last = m.index + t.length;
   }
   if (last < text.length) parent.append(text.slice(last));
 }
+// Links open in the user's own browser, never inside Lu.
+function link(text, url) {
+  const a = el("a", { class: "link", href: url, title: url, text });
+  a.addEventListener("click", (e) => { e.preventDefault(); call("open_link", { url }).catch((err) => toast(String(err))); });
+  return a;
+}
+// "![caption](src)" lines (one or more images on a line, or a bare YouTube /
+// media address on its own line): the items to embed, or null.
+function mediaLine(line) {
+  const t = line.trim();
+  const imgs = [...t.matchAll(/!\[([^\]]*)\]\(([^)\s]+)\)/g)];
+  if (imgs.length && !t.replace(/!\[[^\]]*\]\([^)\s]+\)/g, "").trim()) return imgs.map((m) => ({ src: m[2], caption: m[1] }));
+  if (/^(https?:\/\/|[a-z]:[\\/])\S+$/i.test(t) && (youtubeId(t) || embeddable(t))) return [{ src: t }];
+  return null;
+}
+
 export function renderReply(text, into) {
   into.textContent = "";
   const lines = text.split("\n");
@@ -150,6 +170,12 @@ export function renderReply(text, into) {
       while (i < lines.length && !lines[i].startsWith("```")) code.push(lines[i++]);
       const closed = i < lines.length;
       i++;
+      if (lang === "gallery") {
+        if (!closed) { into.append(el("div", { class: "chart chart-wait", text: "Putting pictures together…" })); continue; }
+        try { into.append(drawGallery(parseGallery(code.join("\n")))); }
+        catch (e) { into.append(el("div", { class: "note-line", text: `This gallery could not be shown: ${e.message}.` })); }
+        continue;
+      }
       // Chart data in a plain or json block counts too (models drop the word).
       let isChart = lang === "chart";
       if (!isChart && closed && (lang === "" || lang === "json")) {
@@ -176,6 +202,15 @@ export function renderReply(text, into) {
       const t = drawTable(rows);
       t.paint(inline);
       into.append(t.node);
+      continue;
+    }
+    // Pictures, music and video on their own lines; several on one line make a row.
+    const media = mediaLine(line);
+    if (media) {
+      flush(); list = null;
+      const items = [...media];
+      into.append(items.length === 1 ? mediaItem(items[0]) : drawGallery({ title: "", layout: "row", columns: items.length, items }));
+      i++;
       continue;
     }
     const h = line.match(/^(#{1,3})\s+(.*)/);
