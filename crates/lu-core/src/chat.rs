@@ -28,7 +28,7 @@ use serde_json::{json, Map, Value};
 
 use crate::ansf_live_chat::{LiveEvent, LiveKind};
 use crate::archive::ArchiveLimits;
-use crate::engines::{ChatMessage, EngineError, LlamaServer, ToolCall, ToolSpec};
+use crate::engines::{ChatMessage, ChatOptions, EngineError, LlamaServer, ToolCall, ToolSpec};
 use crate::environment::EnvironmentStore;
 use crate::files::{Call, Content, FileAccess, FileError, ReadResult, WriteMode, WriteRequest};
 use crate::loop_guard::{ToolLoopGuard, ToolLoopLimits, ToolLoopVerdict};
@@ -72,6 +72,8 @@ pub struct ChatConfig {
     /// Model replies per user turn (each tool round is one).
     pub max_rounds: u32,
     pub max_tokens: u32,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
     pub command_timeout: Duration,
     /// Environment facts older than this are checked again before use.
     pub facts_max_age: Duration,
@@ -85,6 +87,8 @@ impl ChatConfig {
             memory_budget: crate::memory::DEFAULT_BUDGET_CHARS,
             max_rounds: 24,
             max_tokens: 4096,
+            temperature: None,
+            top_p: None,
             command_timeout: Duration::from_secs(300),
             facts_max_age: Duration::from_secs(24 * 3600),
         }
@@ -235,7 +239,8 @@ impl<'a> ChatLoop<'a> {
         let mut speed = None;
         for round in 0..self.config.max_rounds {
             let mut on_text = |t: &str| on_event(ChatEvent::Text(t.to_owned()));
-            let reply = engine.chat(&messages, &tools, self.config.max_tokens, &mut on_text)?;
+            let options = ChatOptions { max_tokens: self.config.max_tokens, temperature: self.config.temperature, top_p: self.config.top_p };
+            let reply = engine.chat(&messages, &tools, &options, &mut on_text)?;
             speed = reply.tokens_per_second.or(speed);
             if reply.finish_reason == "loop" {
                 answer.push_str(&reply.content);

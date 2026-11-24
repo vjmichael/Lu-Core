@@ -1159,6 +1159,20 @@ pub struct ToolSpec {
     pub parameters: String,
 }
 
+/// Per-request generation options.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChatOptions {
+    pub max_tokens: u32,
+    /// `None` uses the model's own default.
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+}
+impl Default for ChatOptions {
+    fn default() -> Self {
+        Self { max_tokens: 4096, temperature: None, top_p: None }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatReply {
     pub content: String,
@@ -1343,7 +1357,7 @@ impl LlamaServer {
     /// text goes to `on_text` as it arrives. Tool calls are collected and
     /// returned, not run. The stream loop guard stops a reply that repeats
     /// itself; the partial reply is returned with finish reason `loop`.
-    pub fn chat(&mut self, messages: &[ChatMessage], tools: &[ToolSpec], max_tokens: u32, on_text: &mut dyn FnMut(&str)) -> Result<ChatReply, EngineError> {
+    pub fn chat(&mut self, messages: &[ChatMessage], tools: &[ToolSpec], options: &ChatOptions, on_text: &mut dyn FnMut(&str)) -> Result<ChatReply, EngineError> {
         let r = self.running.as_ref().ok_or_else(|| EngineError::Invalid("no model loaded".into()))?;
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", r.port);
         let key = r.key.clone();
@@ -1351,10 +1365,16 @@ impl LlamaServer {
         let mut body = serde_json::json!({
             "messages": messages.iter().map(ChatMessage::to_json).collect::<Vec<_>>(),
             "stream": true,
-            "max_tokens": max_tokens,
+            "max_tokens": options.max_tokens,
             "cache_prompt": true,
             "timings_per_token": false,
         });
+        if let Some(t) = options.temperature {
+            body["temperature"] = serde_json::json!(t);
+        }
+        if let Some(p) = options.top_p {
+            body["top_p"] = serde_json::json!(p);
+        }
         if !tools.is_empty() {
             let mut list = Vec::new();
             for t in tools {

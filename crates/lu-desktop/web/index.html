@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lu</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="panel lit side">
+      <div class="brand"><div class="lamp"></div><b>Lu</b></div>
+      <div class="actions">
+        <button class="btn primary" id="new-chat" title="New conversation (Ctrl+N)">＋ New conversation</button>
+        <button class="btn icon" id="new-folder" title="New folder">▱</button>
+      </div>
+      <div class="search"><input class="input" id="search" placeholder="Search conversations" autocomplete="off"></div>
+      <div class="tree scroll" id="tree"></div>
+      <div class="foot">
+        <button class="btn ghost" id="open-models">Models</button>
+        <button class="btn ghost" id="open-manager">Manage</button>
+        <button class="btn ghost icon" id="settings" title="Settings">⚙</button>
+      </div>
+    </aside>
+
+    <main class="panel main">
+      <div class="bar">
+        <div class="title" id="title">New conversation</div>
+        <div class="model-pill" id="model-pill" title="Choose a model">
+          <span class="dot" id="model-dot"></span>
+          <span class="n" id="model-name">No model loaded</span>
+          <span class="b" id="model-backend"></span>
+          <span class="faint">▾</span>
+        </div>
+      </div>
+      <div class="loadbar"><div class="strip-bar hidden" id="loadbar"><i></i></div></div>
+      <div class="thread scroll" id="thread"><div class="inner" id="messages"></div></div>
+      <div class="composer">
+        <div class="panel box">
+          <textarea id="input" rows="1" placeholder="Message Lu"></textarea>
+          <button class="btn primary" id="send">Send</button>
+        </div>
+        <div class="hint" id="hint">Enter to send · Shift+Enter for a new line</div>
+      </div>
+    </main>
+  </div>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
