@@ -129,7 +129,19 @@ mod imp {
     impl Tree {
         pub fn spawn(mut command: Command) -> io::Result<(Child, Tree)> {
             command.process_group(0);
-            let child = command.spawn()?;
+            // ETXTBSY: a program written moments ago can still be open for
+            // writing in another process forked meanwhile (parallel installs,
+            // tests). It clears in milliseconds; retry briefly.
+            let mut tries = 0;
+            let child = loop {
+                match command.spawn() {
+                    Err(e) if e.raw_os_error() == Some(26) && tries < 40 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    other => break other?,
+                }
+            };
             let pgid = child.id() as i32;
             Ok((child, Tree { pgid }))
         }
