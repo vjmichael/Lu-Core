@@ -409,7 +409,7 @@ fn import_model(app: State<App>, path: String) -> R<i64> {
 
 /// Model files found in LM Studio's folder (or another folder), to import.
 #[tauri::command]
-fn scan_models(folder: Option<String>) -> R<Vec<Value>> {
+async fn scan_models(folder: Option<String>) -> R<Vec<Value>> {
     let dir = folder.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap_or_default()).join(".lmstudio").join("models"));
     Ok(find_gguf(&dir, 500)
         .into_iter()
@@ -479,7 +479,7 @@ fn hf_download(handle: AppHandle, app: State<App>, repo: String, revision: Strin
 // ---------------------------------------------------------------- commands: engines
 
 #[tauri::command]
-fn engines(app: State<App>) -> R<Value> {
+async fn engines(app: State<'_, App>) -> R<Value> {
     let base = app.base;
     let rec = Recorder::new(&base.control, &base.journal, CONTROL);
     let store = EngineStore::open(&base.data.join("engines"), shipped_pins(), &base.source, &rec, &base.gate, &base.governor).map_err(s)?;
@@ -580,7 +580,9 @@ fn set_workspace(app: State<App>, path: String) -> R<()> {
 }
 
 #[tauri::command]
-fn open_window(handle: AppHandle, kind: String, tab: Option<String>) -> R<()> {
+/// Async on purpose: creating a window from a synchronous command
+/// deadlocks on Windows (WebView2 needs the main thread the command holds).
+async fn open_window(handle: AppHandle, kind: String, tab: Option<String>) -> R<()> {
     let (label, title, file, w, h) = match kind.as_str() {
         "models" => ("models", "Lu · Models", "models.html", 980.0, 680.0),
         "manager" => ("manager", "Lu · Conversations", "manager.html", 900.0, 640.0),
