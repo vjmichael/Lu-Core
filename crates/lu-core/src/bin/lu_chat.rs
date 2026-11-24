@@ -140,7 +140,7 @@ fn run() -> Result<(), String> {
             }
             ChatEvent::ActionStarted { what, .. } => eprint!("\n  [{what}]"),
             ChatEvent::ActionFinished { ok, .. } => eprint!("{}", if ok { " ok\n" } else { " failed\n" }),
-            ChatEvent::Held { what, reason } => eprint!("\n  [held: {what}: {reason}]\n"),
+            ChatEvent::Held { what, reason, .. } => eprint!("\n  [held: {what}: {reason}]\n"),
             ChatEvent::Done => {}
         });
         match out {

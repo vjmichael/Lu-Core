@@ -239,6 +239,11 @@ pub fn parse_review(info: &[u8], tree: &[u8], repo_id: &str) -> Result<RepoRevie
             skipped.push((path.to_owned(), "an unsafe or nested path".into()));
             continue;
         }
+        let lower = path.to_ascii_lowercase();
+        if lower.starts_with("mtp/") || lower.contains("/mtp") || lower.rsplit('/').next().is_some_and(|n| n.starts_with("mtp-") || n.starts_with("mtp_")) {
+            skipped.push((path.to_owned(), "a draft head for faster generation (MTP), not a model on its own".into()));
+            continue;
+        }
         if path.to_ascii_lowercase().contains("imatrix") {
             skipped.push((path.to_owned(), "an importance matrix (quantization data), not a model".into()));
             continue;

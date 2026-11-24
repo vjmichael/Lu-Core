@@ -15,6 +15,7 @@
 mod catalog;
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -28,7 +29,7 @@ use catalog::{find_gguf, Catalog, ModelEntry, ModelSettings};
 use lu_core::{
     ansf::AnsfStore,
     ansf_live_chat::{LiveEvent, LiveKind},
-    chat::{new_id, ChatConfig, ChatEvent, ChatLoop, DEFAULT_SYSTEM_PROMPT},
+    chat::{folders_named, new_id, ChatConfig, ChatEvent, ChatLoop, DEFAULT_SYSTEM_PROMPT},
     conversations::{ConversationLibrary, SearchHit},
     engines::{load_with_fallback, shipped_packs, shipped_pins, EngineSource, EngineStore, LlamaServer, RunSettings, Variant},
     environment::EnvironmentStore,
@@ -130,6 +131,27 @@ enum Job {
     Unload,
     Send { chat: String, text: String },
 }
+
+/// Downloads and engine installs in progress, so any window or tab that
+/// opens later shows them correctly. Keyed by `download:<repo>/<file>` or
+/// `engine:<id>`.
+static TRANSFERS: Mutex<BTreeMap<String, Value>> = Mutex::new(BTreeMap::new());
+fn transfer(key: &str, v: Option<Value>) {
+    if let Ok(mut t) = TRANSFERS.lock() {
+        match v {
+            Some(v) => {
+                t.insert(key.to_owned(), v);
+            }
+            None => {
+                t.remove(key);
+            }
+        }
+    }
+}
+/// The answer being written right now, per conversation, so a conversation
+/// reopened mid-answer shows it. Also which conversations are waiting.
+static LIVE: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+static WAITING: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 struct App {
     base: &'static Base,
@@ -233,6 +255,12 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                 }
             }
             Job::Send { chat, text } => {
+                if let Ok(mut w) = WAITING.lock() {
+                    if let Some(i) = w.iter().position(|c| *c == chat) {
+                        w.remove(i);
+                    }
+                }
+                let _ = app.emit("chat-event", json!({"chat": chat, "type": "started"}));
                 let Some((server, model)) = engine.as_mut() else {
                     let _ = app.emit("chat-event", json!({"chat": chat, "type": "error", "text": "Load a model first."}));
                     continue;
@@ -265,7 +293,16 @@ fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, mode
     let rec = Recorder::new(&book, &base.journal, chat);
     let workspace = base.workspace();
     let workspace = std::fs::canonicalize(&workspace).map(|p| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\").to_owned())).unwrap_or(workspace);
-    let files = FileAccess::new(&rec, &base.snapshots, &base.gate, WorkingScope::new(std::slice::from_ref(&workspace)).map_err(|e| format!("{e:?}"))?, SnapshotLimits::default());
+    // Where Lu may work: the workspace, folders the user allowed before, and
+    // folders the user names in this very message (their words are the OK).
+    let mut roots = vec![workspace.clone()];
+    for p in base.catalog.allowed_folders().into_iter().chain(folders_named(text)) {
+        let p = std::fs::canonicalize(&p).map(|c| PathBuf::from(c.to_string_lossy().trim_start_matches(r"\\?\").to_owned())).unwrap_or(p);
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    }
+    let files = FileAccess::new(&rec, &base.snapshots, &base.gate, WorkingScope::new(&roots).map_err(|e| format!("{e:?}"))?, SnapshotLimits::default());
     let runner = CommandRunner::new(&rec, &base.snapshots, &base.gate, SnapshotLimits::default(), &base.data.join("runner")).map_err(|e| format!("{e:?}"))?;
     let mut config = ChatConfig::new(&workspace);
     config.system_prompt = model.settings.system_prompt.clone().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
@@ -273,18 +310,33 @@ fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, mode
     config.top_p = model.settings.top_p;
     let lp = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: Some(&base.environment), profile: None, config };
     let chat_id = chat.to_owned();
+    if let Ok(mut l) = LIVE.lock() {
+        l.insert(chat_id.clone(), String::new());
+    }
     let out = lp
         .turn(server, text, &mut |ev| {
             let payload = match ev {
-                ChatEvent::Text(t) => json!({"chat": chat_id, "type": "text", "text": t}),
+                ChatEvent::Text(t) => {
+                    if let Ok(mut l) = LIVE.lock() {
+                        l.entry(chat_id.clone()).or_default().push_str(&t);
+                    }
+                    json!({"chat": chat_id, "type": "text", "text": t})
+                }
                 ChatEvent::ActionStarted { what, .. } => json!({"chat": chat_id, "type": "action", "text": what}),
                 ChatEvent::ActionFinished { ok, what, .. } => json!({"chat": chat_id, "type": "action-done", "ok": ok, "text": what}),
-                ChatEvent::Held { what, .. } => json!({"chat": chat_id, "type": "held", "text": format!("{what} is waiting for your OK. Reply to approve it.")}),
+                ChatEvent::Held { what, folder, .. } => match folder {
+                    Some(f) => json!({"chat": chat_id, "type": "held", "folder": f, "text": format!("{what} needs a folder Lu has not been allowed to work in: {f}")}),
+                    None => json!({"chat": chat_id, "type": "held", "text": format!("{what} is waiting for your OK. Reply to approve it.")}),
+                },
                 ChatEvent::Done => json!({"chat": chat_id, "type": "done"}),
             };
             let _ = app.emit("chat-event", payload);
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+    if let Ok(mut l) = LIVE.lock() {
+        l.remove(chat);
+    }
+    let out = out?;
     base.library.note_message(chat, "assistant", &out.answer).map_err(|e| e.to_string())?;
     let _ = app.emit("chat-event", json!({"chat": chat, "type": "finished", "speed": out.tokens_per_second, "stopped": out.stopped}));
     let _ = app.emit("library-changed", ());
@@ -357,11 +409,24 @@ fn erase_chat(app: State<App>, trash_id: String) -> R<()> {
     app.base.library.empty_trash_item(&trash_id).map_err(s)
 }
 #[tauri::command]
-fn send_message(app: State<App>, chat: String, text: String) -> R<()> {
+fn send_message(handle: AppHandle, app: State<App>, chat: String, text: String) -> R<()> {
     if text.trim().is_empty() {
         return Err("nothing to send".into());
     }
+    let busy = app.status.lock().map_err(s)?.busy || !WAITING.lock().map_err(s)?.is_empty();
+    WAITING.lock().map_err(s)?.push(chat.clone());
+    if busy {
+        let _ = handle.emit("chat-event", json!({"chat": chat, "type": "queued"}));
+    }
     app.jobs.lock().map_err(s)?.send(Job::Send { chat, text }).map_err(s)
+}
+
+/// What a conversation is doing now: its answer so far, or that it waits.
+#[tauri::command]
+fn chat_live(id: String) -> R<Value> {
+    let text = LIVE.lock().map_err(s)?.get(&id).cloned();
+    let waiting = WAITING.lock().map_err(s)?.contains(&id);
+    Ok(json!({"writing": text.is_some(), "text": text, "waiting": waiting}))
 }
 
 // ---------------------------------------------------------------- commands: models
@@ -395,6 +460,47 @@ fn remove_model(app: State<App>, id: i64) -> R<()> {
     app.base.catalog.remove(id)
 }
 
+/// Delete a downloaded model's files from disk (and take it off the list).
+/// Imported models live in the user's own folders; Lu never deletes those.
+#[tauri::command]
+fn delete_model(handle: AppHandle, app: State<App>, id: i64) -> R<u64> {
+    let m = app.base.catalog.get(id)?;
+    let models_dir = app.base.data.join("models");
+    let path = PathBuf::from(&m.path);
+    if m.source != "downloaded" || !path.starts_with(&models_dir) {
+        return Err("This model was imported from your own folder, so Lu will not delete its file. Use Remove to take it off the list.".into());
+    }
+    if app.status.lock().map_err(s)?.model_id == Some(id) {
+        return Err("Unload this model first.".into());
+    }
+    app.base.instruction(&format!("Delete the model files of {}", m.name))?;
+    let mut freed = 0;
+    let mut gone = vec![path.clone()];
+    if let Some(p) = m.projector.as_ref().map(PathBuf::from).filter(|p| p.starts_with(&models_dir)) {
+        gone.push(p);
+    }
+    // Split models: every shard next to the first one.
+    if let (Some(dir), Some(stem)) = (path.parent(), path.file_name().and_then(|n| n.to_str()).and_then(|n| n.split("-00001-of-").next())) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n != stem && n.starts_with(stem) && n.contains("-of-") && n.ends_with(".gguf") && !gone.contains(&e.path()) {
+                    gone.push(e.path());
+                }
+            }
+        }
+    }
+    for p in &gone {
+        if let Ok(md) = std::fs::metadata(p) {
+            std::fs::remove_file(p).map_err(|e| format!("Could not delete {}: {e}", p.display()))?;
+            freed += md.len();
+        }
+    }
+    app.base.catalog.remove(id)?;
+    let _ = handle.emit("models-changed", ());
+    Ok(freed)
+}
+
 /// Add a GGUF file the user already has (it stays where it is).
 #[tauri::command]
 fn import_model(app: State<App>, path: String) -> R<i64> {
@@ -402,6 +508,9 @@ fn import_model(app: State<App>, path: String) -> R<i64> {
     let info = gguf::inspect(&p).map_err(|e| format!("This is not a model file Lu can use: {e}"))?;
     if info.is_projector() {
         return Err("This is a vision projector, not a model. Import the model, then pair the projector in its settings.".into());
+    }
+    if info.architecture.as_deref().is_some_and(|a| a.ends_with("mtp") || a.ends_with("_mtp")) || p.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().starts_with("mtp")) {
+        return Err("This file is a draft head for faster generation (MTP). It only works next to its main model and cannot be loaded on its own.".into());
     }
     let name = info.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
     app.base.catalog.add(&p, &name, info.architecture.as_deref(), info.context_length, info.file_bytes, "imported", None, None)
@@ -448,6 +557,12 @@ fn hf_download(handle: AppHandle, app: State<App>, repo: String, revision: Strin
     // The click is the user's instruction: name exactly what is installed.
     let summary = format!("install model {}@{}: {}", req.repo_id, &req.revision[..req.revision.len().min(12)], names.join(", "));
     let turn = base.instruction(&format!("Download {summary}"))?;
+    let total: u64 = req.files.iter().chain(req.projector.as_ref()).map(|f| f.bytes).sum();
+    let key = format!("download:{}/{}", repo, names.first().cloned().unwrap_or_default());
+    let history = base.catalog.download_started(&repo, &names.join(", "), total)?;
+    let first_file = names.first().cloned().unwrap_or_default();
+    transfer(&key, Some(json!({"kind": "download", "repo": repo, "file": first_file, "done": 0, "total": total})));
+    let _ = handle.emit("download-event", json!({"repo": repo, "file": first_file, "done": 0, "total": total, "started": true}));
     thread::spawn(move || {
         let rec = Recorder::new(&base.control, &base.journal, CONTROL);
         let emit = |v: Value| {
@@ -456,10 +571,12 @@ fn hf_download(handle: AppHandle, app: State<App>, repo: String, revision: Strin
         let result = ModelInstaller::new(&base.data.join("models"), &base.hub, &rec, &base.gate, &base.governor).and_then(|inst| {
             let mut last = 0u64;
             inst.install(&new_id('c'), &turn, &req, &AtomicBool::new(false), &mut |file, done, total| {
-                let pct = done * 100 / total.max(1);
+                let pct = done * 1000 / total.max(1);
                 if pct != last {
                     last = pct;
-                    emit(json!({"repo": repo, "file": file, "done": done, "total": total}));
+                    let v = json!({"kind": "download", "repo": repo, "file": file, "first": first_file, "done": done, "total": total});
+                    transfer(&key, Some(v.clone()));
+                    emit(v);
                 }
             })
         });
@@ -468,9 +585,15 @@ fn hf_download(handle: AppHandle, app: State<App>, repo: String, revision: Strin
                 let first = &installed.model[0];
                 let name = first.info.name.clone().unwrap_or_else(|| first.repo_file.clone());
                 let _ = base.catalog.add(&first.path, &name, first.info.architecture.as_deref(), first.info.context_length, installed.model.iter().map(|f| f.bytes).sum(), "downloaded", Some(&repo), installed.projector.as_ref().map(|p| p.path.as_path()));
-                emit(json!({"repo": repo, "finished": true}));
+                transfer(&key, None);
+                let _ = base.catalog.download_ended(history, true, None);
+                emit(json!({"repo": repo, "file": first_file, "finished": true}));
             }
-            Err(e) => emit(json!({"repo": repo, "error": e.to_string()})),
+            Err(e) => {
+                transfer(&key, None);
+                let _ = base.catalog.download_ended(history, false, Some(&e.to_string()));
+                emit(json!({"repo": repo, "file": first_file, "error": e.to_string()}));
+            }
         }
     });
     Ok(())
@@ -516,9 +639,19 @@ fn install_engine(handle: AppHandle, app: State<App>, variant: String) -> R<()> 
     let v = Variant::parse(&variant).ok_or("unknown engine")?;
     let turn = base.instruction(&format!("Install the {} engine", v.as_str()))?;
     thread::spawn(move || {
+        let key = format!("engine:{}", v.as_str());
         let emit = |x: Value| {
+            if x.get("finished").is_some() || x.get("error").is_some() {
+                transfer(&key, None);
+            } else {
+                let mut t = x.clone();
+                t["kind"] = json!("engine");
+                t["id"] = json!(v.as_str());
+                transfer(&key, Some(t));
+            }
             let _ = handle.emit("engine-event", x);
         };
+        emit(json!({"id": v.as_str(), "stage": "Starting", "done": 0, "total": 1}));
         let rec = Recorder::new(&base.control, &base.journal, CONTROL);
         let result = (|| -> Result<(), String> {
             let store = EngineStore::open(&base.data.join("engines"), shipped_pins(), &base.source, &rec, &base.gate, &base.governor).map_err(s)?;
@@ -531,7 +664,7 @@ fn install_engine(handle: AppHandle, app: State<App>, variant: String) -> R<()> 
                         let pct = d * 100 / t.max(1);
                         if pct != last {
                             last = pct;
-                            emit(json!({"id": "rocm", "stage": "ROCm support files", "done": d, "total": t}));
+                            emit(json!({"id": "rocm", "stage": "GPU support files", "done": d, "total": t}));
                         }
                     })
                     .map_err(s)?;
@@ -570,8 +703,35 @@ fn rollback_engine(app: State<App>, variant: String) -> R<String> {
 
 #[tauri::command]
 fn app_settings(app: State<App>) -> R<Value> {
-    Ok(json!({"workspace": app.base.workspace().to_string_lossy(), "data": app.base.data.to_string_lossy()}))
+    Ok(json!({"workspace": app.base.workspace().to_string_lossy(), "data": app.base.data.to_string_lossy(), "allowed": app.base.catalog.allowed_folders()}))
 }
+#[tauri::command]
+fn transfers() -> R<Vec<Value>> {
+    Ok(TRANSFERS.lock().map_err(s)?.values().cloned().collect())
+}
+#[tauri::command]
+fn download_history(app: State<App>) -> R<Vec<catalog::DownloadRow>> {
+    app.base.catalog.downloads()
+}
+#[tauri::command]
+fn clear_download_history(app: State<App>) -> R<()> {
+    app.base.catalog.clear_download_history()
+}
+/// The user allows Lu to work in a folder from now on.
+#[tauri::command]
+fn allow_folder(app: State<App>, path: String) -> R<()> {
+    let p = PathBuf::from(path.trim().trim_matches('"'));
+    if !p.is_dir() {
+        return Err("That folder does not exist.".into());
+    }
+    app.base.instruction(&format!("Allow Lu to work in {}", p.display()))?;
+    app.base.catalog.allow_folder(&p)
+}
+#[tauri::command]
+fn forget_folder(app: State<App>, path: String) -> R<()> {
+    app.base.catalog.forget_folder(&path)
+}
+
 #[tauri::command]
 fn set_workspace(app: State<App>, path: String) -> R<()> {
     let p = PathBuf::from(path.trim().trim_matches('"'));
@@ -624,9 +784,9 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            library, new_chat, rename_chat, delete_chat, new_folder, rename_folder, delete_folder, move_chat, search_chats, chat_messages, trash, restore_chat, erase_chat, send_message,
-            model_status, load_model, unload_model, models, save_model_settings, rename_model, remove_model, import_model, scan_models,
-            hf_search, hf_files, hf_download, engines, install_engine, rollback_engine, app_settings, set_workspace, open_window
+            library, new_chat, rename_chat, delete_chat, new_folder, rename_folder, delete_folder, move_chat, search_chats, chat_messages, trash, restore_chat, erase_chat, send_message, chat_live,
+            model_status, load_model, unload_model, models, save_model_settings, rename_model, remove_model, delete_model, import_model, scan_models,
+            hf_search, hf_files, hf_download, engines, install_engine, rollback_engine, app_settings, set_workspace, open_window, transfers, download_history, clear_download_history, allow_folder, forget_folder
         ])
         .run(tauri::generate_context!())
         .expect("Lu failed to start");

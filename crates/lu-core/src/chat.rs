@@ -53,8 +53,9 @@ pub enum ChatEvent {
     ActionStarted { tool: String, what: String },
     /// The action finished; `ok` is false for errors and refusals.
     ActionFinished { tool: String, ok: bool, what: String },
-    /// An action is waiting for the user's approval.
-    Held { what: String, reason: String },
+    /// An action is waiting for the user's approval. `folder` is set when
+    /// the action was outside the folders Lu may work in.
+    Held { what: String, reason: String, folder: Option<String> },
     /// The turn ended (the answer is in the outcome).
     Done,
 }
@@ -298,8 +299,8 @@ impl<'a> ChatLoop<'a> {
         let result = self.dispatch(&c, &call.name, &args);
         let (ok, text) = match result {
             Ok(text) => (true, text),
-            Err(ToolFailure::Held(reason)) => {
-                on_event(ChatEvent::Held { what: what.clone(), reason: reason.clone() });
+            Err(ToolFailure::Held(reason, folder)) => {
+                on_event(ChatEvent::Held { what: what.clone(), reason: reason.clone(), folder });
                 (false, format!("held: {reason}. Lu has asked the user; do not try to get around it."))
             }
             Err(ToolFailure::Error(e)) => (false, format!("error: {e}")),
@@ -435,12 +436,18 @@ impl<'a> ChatLoop<'a> {
 }
 
 enum ToolFailure {
-    Held(String),
+    Held(String, Option<String>),
     Error(String),
 }
 fn file_failure(e: FileError) -> ToolFailure {
     match e {
-        FileError::Held { reason, .. } => ToolFailure::Held(reason),
+        FileError::Held { reason, path, .. } => {
+            let folder = reason.contains("working scope").then(|| {
+                let dir = if path.is_dir() { path.clone() } else { path.parent().map(Path::to_path_buf).unwrap_or(path.clone()) };
+                dir.to_string_lossy().into_owned()
+            });
+            ToolFailure::Held(reason, folder)
+        }
         FileError::Refused { reason } => ToolFailure::Error(format!("refused: {reason}")),
         FileError::NotFound => ToolFailure::Error("not found".into()),
         FileError::AlreadyExists => ToolFailure::Error("it already exists (use replace to overwrite)".into()),
@@ -450,7 +457,7 @@ fn file_failure(e: FileError) -> ToolFailure {
 }
 fn run_failure(e: RunError) -> ToolFailure {
     match e {
-        RunError::Held { source, .. } => ToolFailure::Held(format!("it was asked for after reading outside content ({:?} {})", source.kind, source.reference)),
+        RunError::Held { source, .. } => ToolFailure::Held(format!("it was asked for after reading outside content ({:?} {})", source.kind, source.reference), None),
         RunError::Refused { source } => ToolFailure::Error(format!("refused: a send asked for by outside content ({})", source.reference)),
         other => ToolFailure::Error(format!("{other:?}")),
     }
@@ -461,11 +468,7 @@ fn describe(tool: &str, a: &Map<String, Value>) -> String {
     let get = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
     let name = |p: String| p.rsplit(['/', '\\']).next().unwrap_or("").to_owned();
     match tool {
-        "run_command" => {
-            let cmd = get("command");
-            let short: String = cmd.chars().take(80).collect();
-            format!("Running {short}{}", if cmd.chars().count() > 80 { "…" } else { "" })
-        }
+        "run_command" => "Running a command".to_owned(),
         "read_file" | "lu_read_document" => format!("Reading {}", name(get("path"))),
         "write_file" => format!("Writing {}", name(get("path"))),
         "filesystem" => format!("{} {}", match get("action").as_str() { "list" => "Listing", "copy" => "Copying", "move" => "Moving", "delete" => "Deleting", _ => "Working on" }, name(get("path"))),
@@ -474,6 +477,49 @@ fn describe(tool: &str, a: &Map<String, Value>) -> String {
         "lu_extract_archive" => format!("Extracting {}", name(get("path"))),
         other => format!("Using {other}"),
     }
+}
+
+/// Folders the user named in their own words (absolute paths, or the
+/// folder of a named file). The user's message is the authority to work there.
+pub fn folders_named(text: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let cleaned = text.replace(['"', '\'', '`', '<', '>', '(', ')'], " ");
+    let mut push = |p: PathBuf| {
+        let dir = if p.is_dir() { Some(p) } else { p.parent().filter(|d| d.is_dir()).map(Path::to_path_buf) };
+        if let Some(d) = dir {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    };
+    let b = cleaned.as_bytes();
+    let mut i = 0;
+    while i + 2 < b.len() {
+        let drive = b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'\\' || b[i + 2] == b'/') && (i == 0 || !b[i - 1].is_ascii_alphanumeric());
+        let unix = b[i] == b'/' && (i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\n') && b[i + 1].is_ascii_alphanumeric();
+        if drive || unix {
+            // Take the longest run (spaces allowed) that names something real.
+            let line_end = cleaned[i..].find('\n').map_or(cleaned.len(), |e| i + e);
+            let candidate = cleaned[i..line_end].trim_end_matches(|c: char| c == '.' || c == ',' || c == '?' || c == '!' || c == ':' || c == ';' || c.is_whitespace());
+            let mut end = candidate.len();
+            loop {
+                let piece = candidate[..end].trim_end();
+                let p = PathBuf::from(piece);
+                if p.exists() || p.parent().is_some_and(|d| d.is_dir() && p.file_name().is_some_and(|n| !n.to_string_lossy().contains(' '))) {
+                    push(p);
+                    break;
+                }
+                match piece.rfind(' ') {
+                    Some(sp) => end = sp,
+                    None => break,
+                }
+            }
+            i = line_end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// The tool list as JSON (for logs and the DX private view).

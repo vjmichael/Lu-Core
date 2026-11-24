@@ -44,6 +44,18 @@ pub struct ModelEntry {
     pub settings: ModelSettings,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadRow {
+    pub id: i64,
+    pub repo: String,
+    pub files: String,
+    pub bytes: u64,
+    pub started: String,
+    pub finished: Option<String>,
+    pub outcome: String,
+    pub message: Option<String>,
+}
+
 pub struct Catalog {
     db: Mutex<Connection>,
 }
@@ -63,7 +75,17 @@ impl Catalog {
                 settings TEXT NOT NULL,
                 added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);",
+            CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS allowed_folders (path TEXT PRIMARY KEY NOT NULL, added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS downloads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo TEXT NOT NULL, files TEXT NOT NULL, bytes INTEGER NOT NULL,
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                finished_at TEXT,
+                outcome TEXT NOT NULL DEFAULT 'running' CHECK(outcome IN ('running','finished','failed')),
+                message TEXT
+            );
+            UPDATE downloads SET outcome = 'failed', message = 'Lu closed before it finished', finished_at = CURRENT_TIMESTAMP WHERE outcome = 'running';",
         )
         .map_err(|e| e.to_string())?;
         Ok(Self { db: Mutex::new(db) })
@@ -151,6 +173,48 @@ impl Catalog {
     /// Take a model off the list. The file itself is left alone.
     pub fn remove(&self, id: i64) -> Result<(), String> {
         self.db()?.execute("DELETE FROM models WHERE id = ?1", params![id]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Folders the user allowed Lu to work in, besides the workspace.
+    pub fn allowed_folders(&self) -> Vec<PathBuf> {
+        let Ok(db) = self.db() else { return Vec::new() };
+        let Ok(mut q) = db.prepare("SELECT path FROM allowed_folders ORDER BY path") else { return Vec::new() };
+        q.query_map([], |r| r.get::<_, String>(0)).map(|rows| rows.flatten().map(PathBuf::from).collect()).unwrap_or_default()
+    }
+    pub fn allow_folder(&self, path: &Path) -> Result<(), String> {
+        self.db()?.execute("INSERT OR IGNORE INTO allowed_folders(path) VALUES (?1)", params![path.to_string_lossy()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn forget_folder(&self, path: &str) -> Result<(), String> {
+        self.db()?.execute("DELETE FROM allowed_folders WHERE path = ?1", params![path]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Download history.
+    pub fn download_started(&self, repo: &str, files: &str, bytes: u64) -> Result<i64, String> {
+        let db = self.db()?;
+        db.execute("INSERT INTO downloads(repo, files, bytes) VALUES (?1, ?2, ?3)", params![repo, files, bytes as i64]).map_err(|e| e.to_string())?;
+        Ok(db.last_insert_rowid())
+    }
+    pub fn download_ended(&self, id: i64, ok: bool, message: Option<&str>) -> Result<(), String> {
+        self.db()?
+            .execute("UPDATE downloads SET outcome = ?2, message = ?3, finished_at = CURRENT_TIMESTAMP WHERE id = ?1", params![id, if ok { "finished" } else { "failed" }, message])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn downloads(&self) -> Result<Vec<DownloadRow>, String> {
+        let db = self.db()?;
+        let mut q = db.prepare("SELECT id, repo, files, bytes, started_at, finished_at, outcome, message FROM downloads ORDER BY id DESC LIMIT 200").map_err(|e| e.to_string())?;
+        let rows = q
+            .query_map([], |r| {
+                Ok(DownloadRow { id: r.get(0)?, repo: r.get(1)?, files: r.get(2)?, bytes: r.get::<_, i64>(3)? as u64, started: r.get(4)?, finished: r.get(5)?, outcome: r.get(6)?, message: r.get(7)? })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
+    }
+    pub fn clear_download_history(&self) -> Result<(), String> {
+        self.db()?.execute("DELETE FROM downloads WHERE outcome != 'running'", []).map_err(|e| e.to_string())?;
         Ok(())
     }
 

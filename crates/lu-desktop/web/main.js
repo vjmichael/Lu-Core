@@ -2,7 +2,9 @@ import { call, on, el, $, menu, confirmBox, choiceBox, promptBox, toast, renderR
 
 const state = {
   folders: [], chats: [], open: new Set(JSON.parse(localStorage.getItem("lu-open-folders") || "[]")),
-  current: null, status: { state: "unloaded" }, streaming: null, models: [],
+  current: null, status: { state: "unloaded" }, models: [],
+  // Answers being written, per conversation: { text, items: [{kind, text, ok, folder}], body, waiting }.
+  streams: new Map(),
 };
 const tree = $("#tree"), messages = $("#messages"), input = $("#input"), sendBtn = $("#send");
 
@@ -147,10 +149,26 @@ async function openChat(id) {
   const chat = state.chats.find((c) => c.id === id);
   $("#title").textContent = chat ? chat.title : "Conversation";
   const list = await call("chat_messages", { id });
+  if (state.current !== id) return;
   messages.textContent = "";
   for (const m of list) addMessage(m.role, m.text);
-  if (!list.length) showEmpty();
+  let s = state.streams.get(id);
+  if (!s) {
+    const live = await call("chat_live", { id });
+    if (live.writing || live.waiting) { s = { text: live.text || "", items: [], waiting: live.waiting }; state.streams.set(id, s); }
+  }
+  if (s) {
+    // Waiting: the message is not saved yet, so show it from memory.
+    if (s.waiting && s.user && list.at(-1)?.text !== s.user) addMessage("user", s.user);
+    s.body = addMessage("lu", "");
+    s.body.classList.add("caret");
+    for (const it of s.items) drawItem(s, it);
+    if (s.waiting) s.body.append(waitingNote());
+    else renderReply(s.text, s.body);
+  }
+  if (!list.length && !s) showEmpty();
   scrollDown(true);
+  setBusy();
   drawTreeSelection();
   input.focus();
 }
@@ -181,7 +199,8 @@ async function newChat(folder = null) {
 
 async function send() {
   const text = input.value.trim();
-  if (!text || state.streaming) return;
+  if (!text) return;
+  if (state.current && state.streams.has(state.current)) { toast("Lu is still answering in this conversation."); return; }
   if (state.status.state !== "loaded") { toast("Load a model first: use the model button at the top right."); return; }
   if (!state.current) {
     state.current = await call("new_chat", { folder: null });
@@ -189,53 +208,112 @@ async function send() {
   }
   input.value = ""; autosize();
   addMessage("user", text);
+  const chat = state.current;
   const body = addMessage("lu", "");
   body.classList.add("caret");
-  state.streaming = { chat: state.current, body, text: "", actions: new Map() };
-  setBusy(true);
+  state.streams.set(chat, { text: "", items: [], body, waiting: false, user: text });
+  setBusy();
   scrollDown(true);
-  try { await call("send_message", { chat: state.current, text }); }
-  catch (e) { finishStream(); toast(String(e)); }
+  try { await call("send_message", { chat, text }); }
+  catch (e) { endStream(chat); toast(String(e)); }
 }
 
-function finishStream() {
-  if (state.streaming) state.streaming.body.classList.remove("caret");
-  state.streaming = null;
-  setBusy(false);
+const waitingNote = () => el("div", { class: "faint wait", text: "Waiting for the other conversation to finish…" });
+function endStream(chat) {
+  const s = state.streams.get(chat);
+  if (s?.body) s.body.classList.remove("caret");
+  state.streams.delete(chat);
+  setBusy();
 }
-function setBusy(b) {
+function setBusy() {
+  const b = !!state.current && state.streams.has(state.current);
   sendBtn.disabled = b;
   $("#hint").textContent = b ? "Lu is answering…" : "Enter to send · Shift+Enter for a new line";
 }
+const shown = (chat, s) => chat === state.current && s.body?.isConnected;
+
+function drawItem(s, it) {
+  if (!s.body?.isConnected) return;
+  const row = s.body.parentElement;
+  if (it.kind === "action") {
+    it.node = el("div", { class: "action " + (it.ok == null ? "running" : it.ok ? "done" : "failed"), text: it.text });
+    row.before(it.node);
+  } else if (it.kind === "held") {
+    const n = el("div", { class: "notice" }, el("div", { text: it.text }));
+    if (it.folder) {
+      const btn = el("button", { class: "btn primary", style: "margin-top:8px", onclick: async () => {
+        btn.disabled = true;
+        try {
+          await call("allow_folder", { path: it.folder });
+          btn.textContent = "Allowed";
+          toast("Lu may now work in " + it.folder + ". Ask again to continue.");
+        } catch (e) { btn.disabled = false; toast(String(e)); }
+      } }, "Allow this folder");
+      n.append(btn);
+    }
+    row.before(n);
+  }
+}
 
 on("chat-event", (ev) => {
-  const s = state.streaming;
-  if (!s || ev.chat !== s.chat) return;
-  if (ev.type === "text") {
+  let s = state.streams.get(ev.chat);
+  if (!s) {
+    if (ev.type === "finished" || ev.type === "error") return;
+    s = { text: "", items: [], waiting: false };
+    state.streams.set(ev.chat, s);
+  }
+  const vis = shown(ev.chat, s);
+  if (ev.type === "queued") {
+    s.waiting = true;
+    if (vis) { s.body.textContent = ""; s.body.append(waitingNote()); }
+  } else if (ev.type === "started") {
+    s.waiting = false;
+    if (vis) s.body.textContent = "";
+  } else if (ev.type === "text") {
     s.text += ev.text;
-    renderReply(s.text, s.body);
-    scrollDown();
+    if (vis) { renderReply(s.text, s.body); scrollDown(); }
   } else if (ev.type === "action") {
-    const chip = el("div", { class: "action running", text: ev.text });
-    s.body.parentElement.before(chip);
-    s.actions.set(ev.text, chip);
+    const it = { kind: "action", text: ev.text, ok: null };
+    s.items.push(it);
+    if (vis) drawItem(s, it);
   } else if (ev.type === "action-done") {
-    const chip = s.actions.get(ev.text);
-    if (chip) chip.className = "action " + (ev.ok ? "done" : "failed");
+    const it = [...s.items].reverse().find((x) => x.kind === "action" && x.text === ev.text && x.ok == null);
+    if (it) { it.ok = ev.ok; if (it.node) it.node.className = "action " + (ev.ok ? "done" : "failed"); }
   } else if (ev.type === "held") {
-    s.body.parentElement.before(el("div", { class: "notice", text: ev.text }));
+    const it = { kind: "held", text: ev.text, folder: ev.folder };
+    s.items.push(it);
+    if (vis) drawItem(s, it);
   } else if (ev.type === "error") {
-    s.body.textContent = "";
-    s.body.append(el("div", { class: "notice", text: ev.text }));
-    finishStream();
+    if (vis) { s.body.textContent = ""; s.body.append(el("div", { class: "notice", text: ev.text })); }
+    else toast(ev.text);
+    endStream(ev.chat);
   } else if (ev.type === "finished") {
     const bits = [];
     if (ev.stopped) bits.push("Stopped: " + ev.stopped);
     if (ev.speed) bits.push(`${ev.speed.toFixed(1)} tokens/s`);
-    if (bits.length) s.body.parentElement.after(el("div", { class: "meta", text: bits.join(" · ") }));
-    finishStream();
+    if (vis && bits.length) s.body.parentElement.after(el("div", { class: "meta", text: bits.join(" · ") }));
+    endStream(ev.chat);
   }
 });
+
+// Files dropped on the window: their paths go into the message, which
+// also allows Lu to work in their folders for that message.
+T_drop();
+function T_drop() {
+  const w = window.__TAURI__?.webviewWindow?.getCurrentWebviewWindow?.();
+  if (!w?.onDragDropEvent) return;
+  const comp = document.querySelector(".composer");
+  w.onDragDropEvent((e) => {
+    const p = e.payload;
+    if (p.type === "enter" || p.type === "over") comp.classList.add("drop-target");
+    else comp.classList.remove("drop-target");
+    if (p.type === "drop" && p.paths?.length) {
+      const add = p.paths.join("\n");
+      input.value = input.value.trim() ? input.value.replace(/\s*$/, "\n") + add + "\n" : add + "\n";
+      autosize(); input.focus();
+    }
+  });
+}
 on("library-changed", () => refresh().then(() => {
   const c = state.chats.find((x) => x.id === state.current);
   if (c) $("#title").textContent = c.title;

@@ -125,7 +125,8 @@ fn an_action_outside_the_working_folder_is_held_and_the_user_is_told() {
     let text = format!(r#"TOOL:write_file:{{"path":{},"content":"x"}}"#, serde_json::to_string(&outside.to_string_lossy()).unwrap());
     let out = chat
         .turn(&mut e, &text, &mut |ev| {
-            if let ChatEvent::Held { what, reason } = ev {
+            if let ChatEvent::Held { what, reason, folder } = ev {
+                assert!(folder.is_some());
                 held.push((what, reason));
             }
         })
@@ -148,3 +149,17 @@ fn a_reply_that_repeats_itself_is_stopped() {
     let _ = book;
     let _ = e.unload();
 }
+
+#[test]
+fn folders_named_by_the_user_count_and_others_do_not() {
+    let dir = std::env::temp_dir().join(format!("lu-named-{}", std::process::id()));
+    let sub = dir.join("audit dir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let file = sub.join("01_notes.md");
+    std::fs::write(&file, "x").unwrap();
+    let text = format!("Please edit {} and tidy it.\nAlso look in {}.", file.display(), sub.display());
+    let got = lu_core::chat::folders_named(&text);
+    assert_eq!(got, vec![sub.clone()]);
+    assert!(lu_core::chat::folders_named("no paths here, just C: words").is_empty());
+}
+

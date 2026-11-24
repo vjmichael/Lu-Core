@@ -1,3 +1,8 @@
+.composer.drop-target { outline: 2px dashed var(--accent, #3b82f6); outline-offset: 4px; border-radius: 14px; }
+.wait { font-style: italic; }
+.transfers { display: flex; flex-direction: column; gap: 6px; padding: 10px 16px; border-bottom: 1px solid var(--line, #e5e7eb); background: var(--panel, transparent); }
+.transfers .row { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; font-size: 13px; }
+.transfers .row .strip-bar { grid-column: 1 / -1; height: 6px; }
 /* Lu — a clean station interior: white panels, fine seams, soft light strips,
    one warm amber light. Night mode dims the station; it does not change it. */
 

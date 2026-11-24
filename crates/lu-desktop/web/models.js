@@ -3,13 +3,14 @@ import { call, on, el, $, bytes, toast, confirmBox } from "./common.js";
 const page = $("#page");
 let tab = location.hash.slice(1) || "mine";
 let selected = null;
-const downloads = new Map(); // repo -> {done,total,file,error,finished}
+const downloads = new Map(); // "repo/first file" -> {done,total,file,error,finished}
+const dkey = (repo, first) => `${repo}/${first}`;
 const installs = new Map();  // engine id -> {stage,done,total,error,finished}
 
 function show(t) {
   tab = t;
   for (const b of document.querySelectorAll(".tab")) b.classList.toggle("on", b.dataset.tab === t);
-  ({ mine, discover, imports, engines })[t === "import" ? "imports" : t]();
+  ({ mine, discover, imports, engines, downloads: history })[t === "import" ? "imports" : t]();
 }
 for (const b of document.querySelectorAll(".tab")) b.addEventListener("click", () => show(b.dataset.tab));
 on("open-tab", (t) => show(t));
@@ -76,7 +77,7 @@ function detail(m, st) {
       m.architecture ? el("span", { class: "chip", text: m.architecture }) : null,
       m.trained_context ? el("span", { class: "chip", text: `trained for ${m.trained_context.toLocaleString()} tokens` }) : null,
       el("span", { class: "chip", text: m.source === "downloaded" ? `from ${m.repo}` : "imported" }),
-      m.projector ? el("span", { class: "chip", text: "sees images" }) : null),
+      m.projector ? el("span", { class: "chip", title: "The image support file loads with the model automatically.", text: "sees images" }) : null),
     el("div", { class: "label", style: "margin-bottom:10px", text: "Settings" }),
     el("div", { class: "form" },
       ...field("Context length", ctx),
@@ -88,8 +89,12 @@ function detail(m, st) {
     el("div", { style: "display:flex;gap:8px;margin-top:20px" },
       el("button", { class: "btn primary", onclick: save }, "Save"),
       el("span", { style: "flex:1" }),
-      el("button", { class: "btn danger", onclick: async () => {
-        if (await confirmBox("Remove from the list?", `${m.name} leaves Lu’s list. The file itself stays where it is.`, "Remove")) { await call("remove_model", { id: m.id }); selected = null; mine(); }
+      m.source === "downloaded" ? el("button", { class: "btn danger", onclick: async () => {
+        if (!(await confirmBox("Delete the model file?", `${m.name} (${bytes(m.bytes)}) will be erased from disk${m.projector ? ", with its image support file" : ""}. This cannot be undone; you can download it again later.`, "Delete file"))) return;
+        try { const freed = await call("delete_model", { id: m.id }); toast(`Deleted. ${bytes(freed)} freed.`); selected = null; mine(); } catch (e) { toast(String(e), 7000); }
+      } }, "Delete file") : null,
+      el("button", { class: "btn ghost danger", onclick: async () => {
+        if (await confirmBox("Remove from the list?", `${m.name} leaves Lu’s list. The file itself stays on disk.`, "Remove")) { await call("remove_model", { id: m.id }); selected = null; mine(); }
       } }, "Remove from list")),
     el("div", { class: "faint", style: "margin-top:16px;font-size:12px;word-break:break-all", text: m.path }));
 }
@@ -98,7 +103,7 @@ function detail(m, st) {
 let lastQuery = "";
 async function discover(results) {
   page.textContent = "";
-  const q = el("input", { class: "input", placeholder: "Search Hugging Face for GGUF models", value: lastQuery, style: "max-width:420px" });
+  const q = el("input", { class: "input", placeholder: "Search models on Hugging Face", value: lastQuery, style: "max-width:420px" });
   const go = async () => {
     lastQuery = q.value.trim();
     if (!lastQuery) return;
@@ -107,16 +112,16 @@ async function discover(results) {
     try { discover(await call("hf_search", { query: lastQuery })); } catch (e) { body.textContent = ""; body.append(el("div", { class: "notice", style: "margin:20px", text: String(e) })); }
   };
   q.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
-  page.append(head("Find models", q, el("button", { class: "btn primary", onclick: go }, "Search")));
+  page.append(head("Discover · Hugging Face", q, el("button", { class: "btn primary", onclick: go }, "Search")));
   const body = el("div", { class: "split" });
   page.append(body);
   const list = el("div", { class: "list scroll" });
-  const right = el("div", { class: "detail scroll" }, el("div", { class: "muted", text: results ? "Pick a model to see its files." : "Search by name, for example “Qwen3.8” or “gemma 4”." }));
+  const right = el("div", { class: "detail scroll" }, el("div", { class: "muted", text: results ? "Pick a model to see its files." : "Models come from huggingface.co. Search by name, for example “Qwen3.8” or “gemma 4”." }));
   body.append(list, right);
   for (const r of results || []) {
     list.append(el("div", { class: "card", onclick: (e) => { for (const c of list.children) c.classList.remove("on"); e.currentTarget.classList.add("on"); files(r, right); } },
       el("div", { class: "t", text: r.repo }),
-      el("div", { class: "s", text: `${r.downloads.toLocaleString()} downloads · ${r.license}${r.unavailable ? " · not available" : ""}` })));
+      el("div", { class: "s", text: `Hugging Face · ${r.downloads.toLocaleString()} downloads · ${r.license}${r.unavailable ? " · not available" : ""}` })));
   }
   if (results && !results.length) list.append(el("div", { class: "muted", style: "padding:12px", text: "Nothing found." }));
 }
@@ -127,39 +132,79 @@ async function files(r, into) {
   let info;
   try { info = await call("hf_files", { repo: r.repo }); } catch (e) { into.textContent = ""; into.append(el("div", { class: "notice", text: String(e) })); return; }
   into.textContent = "";
-  into.append(el("h2", { style: "margin:0 0 4px;font-size:17px;font-weight:600", text: info.repo }), el("div", { class: "muted", style: "margin-bottom:16px", text: `License: ${info.license}` }));
+  into.append(el("h2", { style: "margin:0 0 4px;font-size:17px;font-weight:600", text: info.repo }), el("div", { class: "muted", style: "margin-bottom:16px", text: `On Hugging Face · huggingface.co/${info.repo} · License: ${info.license}` }));
   if (info.unavailable) { into.append(el("div", { class: "notice", text: "This model needs a Hugging Face account to download, which Lu does not support yet." })); return; }
   const proj = info.projectors[0];
   const withVision = proj ? el("input", { type: "checkbox", id: "vision" }) : null;
   if (proj) into.append(el("label", { style: "display:flex;gap:8px;align-items:center;margin-bottom:12px" }, withVision, `Also get image support (${bytes(proj.bytes)})`));
   const table = el("table", { class: "grid" }, el("tr", {}, el("th", { text: "Version" }), el("th", { text: "Size" }), el("th")));
   for (const c of info.choices) {
-    const dl = downloads.get(info.repo);
-    const btn = el("button", { class: "btn", onclick: async () => {
-      btn.disabled = true;
+    const key = dkey(info.repo, c.files[0].path);
+    const btn = el("button", { class: "btn dl", onclick: async () => {
+      btn.disabled = true; btn.textContent = "Starting…";
       try {
         await call("hf_download", { repo: info.repo, revision: info.revision, files: c.files, projector: withVision?.checked ? proj : null });
-        downloads.set(info.repo, { done: 0, total: c.bytes, file: c.label });
-        toast(`Downloading ${c.quant || c.label}…`);
-      } catch (e) { btn.disabled = false; toast(String(e)); }
-    } }, dl && !dl.finished && !dl.error ? "Downloading…" : "Download");
-    if (dl && !dl.finished && !dl.error) btn.disabled = true;
+      } catch (e) { btn.disabled = false; btn.textContent = "Download"; toast(String(e)); }
+    } }, "Download");
+    btn.dataset.key = key;
+    drawButton(btn);
     table.append(el("tr", {}, el("td", { text: c.quant || c.label }), el("td", { text: bytes(c.bytes) }), el("td", { style: "text-align:right" }, btn)));
   }
   into.append(table);
-  const bar = el("div", { class: "strip-bar progress-line hidden", id: "dlbar" }, el("i"));
-  into.append(bar);
+}
+
+function drawButton(btn) {
+  const d = downloads.get(btn.dataset.key);
+  const running = d && !d.finished && !d.error;
+  btn.disabled = !!running || !!d?.finished;
+  btn.textContent = running ? `Downloading ${d.total ? Math.floor((d.done / d.total) * 100) : 0}%` : d?.finished ? "Downloaded" : d?.error ? "Try again" : "Download";
+}
+
+// Active transfers stay visible at the top of the window, on every tab.
+function drawStrip() {
+  const strip = $("#strip");
+  strip.textContent = "";
+  const rows = [];
+  for (const [k, d] of downloads) if (!d.finished && !d.error) rows.push([`Downloading ${d.repo} · ${d.file || ""}`, d.done, d.total, k]);
+  for (const [id, j] of installs) if (!j.finished && !j.error && j.stage) rows.push([`Installing ${({ rocm: "ROCm", vulkan: "Vulkan", cpu: "CPU" })[id] || id} · ${j.stage}`, j.done, j.total, id]);
+  for (const [label, done, total] of rows) {
+    const pct = total ? (done / total) * 100 : 0;
+    strip.append(el("div", { class: "row" }, el("span", { text: label }), el("span", { class: "muted", text: `${total > 1 ? bytes(done) + " of " + bytes(total) + " · " : ""}${Math.floor(pct)}%` }),
+      el("div", { class: "strip-bar" }, el("i", { style: `width:${Math.max(pct, 1)}%` }))));
+  }
+  strip.classList.toggle("hidden", !rows.length);
 }
 
 on("download-event", (ev) => {
-  const d = downloads.get(ev.repo) || {};
+  const k = dkey(ev.repo, ev.first || ev.file);
+  const d = downloads.get(k) || { repo: ev.repo };
+  if (ev.started) { delete d.error; delete d.finished; }
   Object.assign(d, ev);
-  downloads.set(ev.repo, d);
-  const bar = $("#dlbar");
-  if (bar && ev.total) { bar.classList.remove("hidden"); bar.firstElementChild.style.width = Math.round((ev.done / ev.total) * 100) + "%"; }
-  if (ev.finished) { toast(`${ev.repo} is ready in My models.`); if (bar) bar.classList.add("hidden"); }
+  downloads.set(k, d);
+  for (const b of document.querySelectorAll("button.dl")) if (b.dataset.key === k) drawButton(b);
+  drawStrip();
+  if (ev.finished) toast(`${ev.repo} is ready in My models.`);
   if (ev.error) toast(`Download stopped: ${ev.error}`, 8000);
+  if ((ev.finished || ev.error || ev.started) && tab === "downloads") history();
 });
+
+// ---------------------------------------------------------------- downloads
+async function history() {
+  const rows = await call("download_history");
+  page.textContent = "";
+  page.append(head("Downloads", el("button", { class: "btn ghost", onclick: async () => { await call("clear_download_history"); history(); } }, "Clear history")));
+  const table = el("table", { class: "grid" }, el("tr", {}, el("th", { text: "Model" }), el("th", { text: "Size" }), el("th", { text: "Started" }), el("th", { text: "Result" })));
+  const label = { running: "Downloading…", finished: "Finished", failed: "Stopped" };
+  for (const r of rows) {
+    table.append(el("tr", {},
+      el("td", {}, el("div", { text: r.repo }), el("div", { class: "faint", style: "font-size:12px", text: r.files })),
+      el("td", { text: bytes(r.bytes) }),
+      el("td", { class: "muted", text: new Date(r.started.replace(" ", "T") + "Z").toLocaleString() }),
+      el("td", { class: r.outcome === "failed" ? "danger" : "muted", title: r.message || "", text: label[r.outcome] + (r.message ? ` · ${r.message}` : "") })));
+  }
+  page.append(el("div", { class: "scroll", style: "flex:1;min-height:0;padding:0 6px" }, table));
+  if (!rows.length) page.append(el("div", { class: "muted", style: "padding:20px", text: "Nothing downloaded yet." }));
+}
 
 // ---------------------------------------------------------------- import
 async function imports() {
@@ -218,7 +263,16 @@ on("engine-event", (ev) => {
   installs.set(ev.id, j);
   if (ev.finished) toast("Engine installed.");
   if (ev.error) toast(`Install stopped: ${ev.error}`, 9000);
+  drawStrip();
   if (tab === "engines") engines();
 });
 
-show(tab);
+// What is already running (started before this window opened).
+(async () => {
+  for (const t of await call("transfers")) {
+    if (t.kind === "download") downloads.set(dkey(t.repo, t.first || t.file), { ...t });
+    else if (t.kind === "engine") installs.set(t.id, { ...t });
+  }
+  drawStrip();
+  show(tab);
+})();
