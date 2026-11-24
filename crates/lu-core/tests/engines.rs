@@ -632,7 +632,7 @@ fn an_installer_bundle_sets_up_engines_and_packs_without_the_network() {
     // A tampered bundle is refused: a changed archive, a changed pack file.
     let lu2 = lu_named(&lu, "bundle-bad");
     let turn2 = say(&lu2, 1, "Set up the engines that came with Lu");
-    fs::write(bundle.join(&cpu.asset), [cpu_bytes.as_slice(), b"x"].concat()[1..].to_vec()).unwrap();
+    fs::write(bundle.join(&cpu.asset), &[cpu_bytes.as_slice(), b"x"].concat()[1..]).unwrap();
     let rec2 = Recorder::new(&lu2.book, &lu2.journal, "c-1");
     let store2 = EngineStore::open(&lu2.dir.join("engines"), vec![cpu.clone()], &src, &rec2, &lu2.gate, &lu2.governor).unwrap();
     assert!(store2.install("e-1", &turn2, &cpu, true, &AtomicBool::new(false), &mut no_progress()).is_err(), "a changed archive never installs");
