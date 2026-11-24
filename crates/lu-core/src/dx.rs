@@ -72,7 +72,7 @@ pub struct Finding {
 }
 impl Finding {
     fn new(check: &str, severity: Severity, summary: impl Into<String>) -> Self {
-        Self { check: check.into(), severity, summary: summary.into(), cause: None, fix: None, evidence: Vec::new(), private_detail: Vec::new() }
+        Self { check: check.into(), severity, summary: sanitize(&summary.into()), cause: None, fix: None, evidence: Vec::new(), private_detail: Vec::new() }
     }
     fn cause(mut self, c: impl Into<String>) -> Self {
         self.cause = Some(sanitize(&c.into()));
@@ -378,8 +378,9 @@ fn check_recent_loads(src: &Sources<'_>) -> Vec<Finding> {
     out
 }
 
+/// A model's file name, whichever system wrote the path.
 fn model_label(model: &str) -> String {
-    Path::new(model).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| model.to_owned())
+    model.rsplit(['/', char::from(92)]).find(|s| !s.is_empty()).unwrap_or(model).to_owned()
 }
 fn median(v: &[f64]) -> Option<f64> {
     if v.is_empty() {
