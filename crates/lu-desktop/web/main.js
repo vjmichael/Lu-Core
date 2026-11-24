@@ -7,6 +7,8 @@ const state = {
   streams: new Map(),
   // What is typed and attached, per conversation ("new" before the first message).
   drafts: new Map(), attach: new Map(),
+  // Messages typed while Lu was still answering, sent in order afterwards.
+  queued: new Map(),
 };
 const tree = $("#tree"), messages = $("#messages"), input = $("#input"), sendBtn = $("#send");
 
@@ -255,26 +257,44 @@ async function send() {
   const text = input.value.trim();
   const files = [...attachments()];
   if (!text && !files.length) return;
-  if (state.current && state.streams.has(state.current)) { toast("Lu is still answering in this conversation."); return; }
   if (state.status.state !== "loaded") { toast("Load a model first: use the model button at the top right."); return; }
   input.value = ""; autosize();
   attachments().length = 0; drawAttach();
   state.drafts.delete(dkey());
+  // Still answering here: queue it; it goes when the answer is done.
+  if (state.current && state.streams.has(state.current)) {
+    const chat = state.current;
+    addMessage("user", composed(text, files));
+    const bubble = messages.lastElementChild;
+    const chip = el("div", { class: "queued-chip" }, "Queued · sends after this answer ", el("button", { class: "x", title: "Remove", onclick: () => {
+      const q = state.queued.get(chat) || [];
+      const i = q.findIndex((x) => x.bubble === bubble);
+      if (i >= 0) q.splice(i, 1);
+      bubble.remove();
+    } }, "×"));
+    bubble.append(chip);
+    if (!state.queued.has(chat)) state.queued.set(chat, []);
+    state.queued.get(chat).push({ text, files, bubble, chip });
+    scrollDown(true);
+    return;
+  }
   await sendText(text, files);
 }
-async function sendText(text, files) {
-  if (!state.current) {
+const composed = (text, files) => (files.length ? `${text}\n${files.map((f) => `\n[Attached] ${f}`).join("")}` : text);
+async function sendText(text, files, queued = null) {
+  if (!state.current && !queued) {
     state.current = await call("new_chat", { folder: null });
     messages.textContent = "";
   }
-  const shown = files.length ? `${text}\n${files.map((f) => `\n[Attached] ${f}`).join("")}` : text;
-  addMessage("user", shown);
-  const chat = state.current;
-  const body = addMessage("lu", "");
-  body.classList.add("caret");
-  state.streams.set(chat, { text: "", items: [], body, waiting: false, user: text });
+  const chat = queued?.chat || state.current;
+  const visible = chat === state.current;
+  if (queued) queued.chip?.remove();
+  else addMessage("user", composed(text, files));
+  const body = visible ? addMessage("lu", "") : null;
+  body?.classList.add("caret");
+  state.streams.set(chat, { text: "", items: [], body: body || undefined, waiting: false, user: text });
   setBusy();
-  scrollDown(true);
+  if (visible) scrollDown(true);
   try { await call("send_message", { chat, text, attachments: files, reasoning: reasoningChoice() }); }
   catch (e) { endStream(chat); toast(String(e)); }
 }
@@ -285,12 +305,15 @@ function endStream(chat) {
   if (s?.body) s.body.classList.remove("caret");
   state.streams.delete(chat);
   setBusy();
+  // The next queued message of this conversation goes now.
+  const next = state.queued.get(chat)?.shift();
+  if (next) setTimeout(() => sendText(next.text, next.files, { chat, chip: next.chip }), 50);
 }
 function setBusy() {
   const b = !!state.current && state.streams.has(state.current);
   sendBtn.textContent = b ? "Stop" : "Send";
   sendBtn.classList.toggle("danger", b);
-  $("#hint").textContent = b ? "Lu is answering… Esc or Stop to stop it" : "Enter to send · Shift+Enter for a new line · drop files to attach";
+  $("#hint").textContent = b ? "Lu is answering… Enter queues your message · Esc or Stop stops the answer" : "Enter to send · Shift+Enter for a new line · drop files to attach";
 }
 function stopCurrent() { if (state.current && state.streams.has(state.current)) call("stop_chat", { chat: state.current }); }
 const shown = (chat, s) => chat === state.current && s.body?.isConnected;
@@ -332,7 +355,8 @@ function paintApproval(it) {
   const card = it.node;
   if (!card?.isConnected) return;
   card.textContent = "";
-  card.append(el("div", { class: "q", text: `${it.what} needs a folder Lu is not allowed to work in yet:` }), el("div", { class: "f", text: it.folder }));
+  if (it.folder) card.append(el("div", { class: "q", text: `${it.what} needs a folder Lu is not allowed to work in yet:` }), el("div", { class: "f", text: it.folder }));
+  else card.append(el("div", { class: "q", text: `${it.what} came after Lu read outside content. Check it before allowing:` }), el("div", { class: "f", text: it.detail || "" }), it.reason ? el("div", { class: "faint", style: "font-size:12px;margin:-4px 0 10px", text: it.reason }) : null);
   if (it.answer) {
     const said = { once: "Allowed for this answer.", always: "Allowed. Lu will remember this folder.", deny: "Not allowed. Lu stopped.", timeout: "No answer in time. Lu stopped; send a new message to try again.", stopped: "Stopped." }[it.answer] || it.answer;
     card.append(el("div", { class: "muted", text: said }));
@@ -342,7 +366,7 @@ function paintApproval(it) {
   const left = Math.max(0, Math.ceil((it.deadline - Date.now()) / 1000));
   card.append(el("div", { class: "btns" },
     el("button", { class: "btn primary", onclick: () => answer("once") }, "Allow"),
-    el("button", { class: "btn", onclick: () => answer("always") }, "Always allow this folder"),
+    it.folder ? el("button", { class: "btn", onclick: () => answer("always") }, "Always allow this folder") : null,
     el("button", { class: "btn ghost", onclick: () => answer("deny") }, "Don’t allow"),
     el("span", { class: "t", text: `Waiting ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}` })));
 }
@@ -371,7 +395,7 @@ on("chat-event", (ev) => {
     s.items.push(it);
     if (vis) drawItem(s, it);
   } else if (ev.type === "approval") {
-    const it = { kind: "approval", id: ev.id, what: ev.what, folder: ev.folder, deadline: Date.now() + ev.seconds * 1000 };
+    const it = { kind: "approval", id: ev.id, what: ev.what, folder: ev.folder, detail: ev.detail, reason: ev.reason, deadline: Date.now() + ev.seconds * 1000 };
     s.items.push(it);
     if (vis) { drawItem(s, it); scrollDown(true); }
     else toast("Lu is waiting for your approval in another conversation.", 6000);

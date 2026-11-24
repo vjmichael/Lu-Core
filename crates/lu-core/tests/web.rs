@@ -141,3 +141,20 @@ fn real_search_and_page() {
     println!("PAGE {} ({} chars)\n{}", p.title, p.text.len(), p.text.chars().take(600).collect::<String>());
     assert!(p.text.len() > 200);
 }
+
+#[test]
+fn pages_list_their_real_pictures() {
+    let html = r#"<html><body><p>Film</p><img src="//upload.wikimedia.org/a/b/Ship.jpg" alt="The ship"><img src="https://x.org/logo.png"><img src="https://x.org/p.gif" width="1" height="1"><img src="/rel.jpg"></body></html>"#;
+    let t = html_to_text(html);
+    assert!(t.contains("![The ship](https://upload.wikimedia.org/a/b/Ship.jpg)"), "{t}");
+    assert!(!t.contains("logo") && !t.contains("p.gif"), "{t}");
+}
+
+#[test]
+#[ignore]
+fn real_page_pictures() {
+    let p = Web::new().read("https://commons.wikimedia.org/wiki/File:Johnny_Depp_as_Captain_Jack_Sparrow_in_Queensland,_Australia.jpg").unwrap();
+    for l in p.text.lines().filter(|l| l.starts_with("![")).take(6) {
+        println!("{l}");
+    }
+}

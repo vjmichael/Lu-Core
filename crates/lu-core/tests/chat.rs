@@ -173,9 +173,9 @@ fn lu_pauses_for_approval_and_continues_or_ends_the_turn() {
     let outside = dir.join("other").join("yes.txt");
     fs::create_dir_all(outside.parent().unwrap()).unwrap();
     let asked = std::cell::Cell::new(0);
-    let yes = |_: &str, folder: &str| {
+    let yes = |a: &lu_core::chat::Approval| {
         asked.set(asked.get() + 1);
-        assert!(folder.ends_with("other"), "{folder}");
+        assert!(a.folder.as_deref().is_some_and(|f| f.ends_with("other")), "{a:?}");
         true
     };
     let chat = ChatLoop { approve: Some(&yes), ..chat };
@@ -191,7 +191,7 @@ fn lu_pauses_for_approval_and_continues_or_ends_the_turn() {
     let mut e = engine(&dir);
     lu!(dir, chat, book);
     let outside = dir.join("no.txt");
-    let no = |_: &str, _: &str| false;
+    let no = |_: &lu_core::chat::Approval| false;
     let chat = ChatLoop { approve: Some(&no), ..chat };
     let text = format!(r#"TOOL:write_file:{{"path":{},"content":"x"}}"#, serde_json::to_string(&outside.to_string_lossy()).unwrap());
     let out = chat.turn(&mut e, &text, &mut |_| {}).unwrap();
@@ -251,4 +251,69 @@ fn web_pages_are_outside_content_and_later_commands_are_held() {
     let held = chat.files.gate().held_actions("c-1").unwrap();
     assert!(held.iter().any(|h| h.text.contains("Remove-Item")), "{held:?}");
     let _ = book;
+}
+
+#[test]
+fn an_approved_command_runs_at_once_and_a_refused_one_ends_the_turn() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let site = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut b = [0u8; 2048];
+            let _ = s.read(&mut b);
+            let body = "<html><title>Tips</title><body><p>Some page.</p></body></html>";
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    let web = lu_core::web::Web::with_search_url(&format!("{site}/html/"));
+    let cmd = if cfg!(windows) { "Write-Output approved-ok" } else { "echo approved-ok" };
+    let text = format!(r#"TOOL:read_web_page:{{"url":"{site}/page"}} then TOOL:run_command:{{"command":"{cmd}"}}"#);
+
+    let dir = base("approve-cmd");
+    let mut e = engine(&dir);
+    lu!(dir, chat, book);
+    let seen = std::cell::RefCell::new(Vec::new());
+    let yes = |a: &lu_core::chat::Approval| {
+        seen.borrow_mut().push(a.clone());
+        true
+    };
+    let chat = ChatLoop { web: Some(&web), approve: Some(&yes), ..chat };
+    let out = chat.turn(&mut e, &text, &mut |_| {}).unwrap();
+    assert!(out.answer.contains("exit code 0"), "{}", out.answer);
+    let asked = seen.borrow();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].detail, cmd, "the user sees the exact command");
+    assert!(asked[0].folder.is_none() && asked[0].reason.contains("outside content"), "{:?}", asked[0]);
+    let _ = book;
+
+    let dir = base("refuse-cmd");
+    let mut e = engine(&dir);
+    lu!(dir, chat, book);
+    let no = |_: &lu_core::chat::Approval| false;
+    let chat = ChatLoop { web: Some(&web), approve: Some(&no), ..chat };
+    let out = chat.turn(&mut e, &text, &mut |_| {}).unwrap();
+    assert!(out.stopped.as_deref().unwrap_or("").contains("approval"), "{:?}", out.stopped);
+    let _ = book;
+}
+
+#[test]
+fn a_long_turn_is_shortened_to_fit_the_context() {
+    use lu_core::{chat::fit_context, engines::ChatMessage};
+    let mut m = vec![ChatMessage::new("system", "sys")];
+    for i in 0..20 {
+        m.push(ChatMessage::new(if i % 2 == 0 { "user" } else { "assistant" }, "old history ".repeat(200)));
+    }
+    let history_end = m.len();
+    m.push(ChatMessage::new("user", "the new question"));
+    for _ in 0..6 {
+        m.push(ChatMessage::new("tool", "page text ".repeat(3000)));
+    }
+    fit_context(&mut m, history_end, 4000);
+    let tokens: usize = m.iter().map(|x| x.content.len() / 3 + 8).sum();
+    assert!(tokens <= 4000, "{tokens}");
+    assert_eq!(m[0].content, "sys", "the system message stays");
+    assert!(m.iter().any(|x| x.content == "the new question"), "the user's question stays");
+    assert!(m.iter().filter(|x| x.role == "tool").all(|x| x.content.contains("shortened by Lu")), "tool output shortened");
 }

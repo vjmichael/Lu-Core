@@ -16,7 +16,9 @@ use ureq::ResponseExt;
 /// Most bytes read from one page.
 const MAX_PAGE_BYTES: u64 = 5 * 1024 * 1024;
 /// Characters of page text returned in one piece.
-pub const PAGE_CHARS: usize = 20_000;
+pub const PAGE_CHARS: usize = 8_000;
+/// Pictures listed from one page.
+const MAX_PAGE_IMAGES: usize = 40;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
@@ -332,6 +334,7 @@ pub fn html_to_text(html: &str) -> String {
     let mut out = String::new();
     let mut skip: Option<String> = None;
     let mut link: Option<String> = None;
+    let mut images = 0;
     let mut i = 0;
     let b = html.as_bytes();
     while i < b.len() {
@@ -354,6 +357,20 @@ pub fn html_to_text(html: &str) -> String {
             if !closing && SKIP.contains(&name.as_str()) && !tag.ends_with('/') {
                 skip = Some(name);
                 continue;
+            }
+            // Pictures: their real addresses, so they can be shown as found
+            // (never guessed). Icons, logos and tracking pixels are left out.
+            if name == "img" && images < MAX_PAGE_IMAGES {
+                let src = attr(tag, "src").map(entities).unwrap_or_default();
+                let src = if src.starts_with("//") { format!("https:{src}") } else { src };
+                let lower = src.to_ascii_lowercase();
+                let noise = ["icon", "logo", "sprite", "pixel", "1x1", "spacer", "badge", "avatar", "/static/images/"].iter().any(|n| lower.contains(n)) || lower.ends_with(".svg");
+                let small = ["width", "height"].iter().any(|d| attr(tag, d).and_then(|v| v.trim_end_matches("px").parse::<u32>().ok()).is_some_and(|v| v < 64));
+                if src.starts_with("https://") && !noise && !small {
+                    let alt = attr(tag, "alt").map(entities).unwrap_or_default();
+                    out.push_str(&format!("\n![{}]({src})\n", alt.replace(['[', ']', '\n'], " ").trim()));
+                    images += 1;
+                }
             }
             if name == "a" {
                 if closing {

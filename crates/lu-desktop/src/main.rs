@@ -30,7 +30,7 @@ use lu_core::{
     ansf::AnsfStore,
     ansf_live_chat::{LiveEvent, LiveKind},
     dx::{self, DxStore, ExactAnswer, Finding, Sources},
-    chat::{folders_named, image_data_url, is_image, new_id, ChatConfig, ChatEvent, ChatLoop, DEFAULT_SYSTEM_PROMPT},
+    chat::{folders_named, image_data_url, Approval, is_image, new_id, ChatConfig, ChatEvent, ChatLoop, DEFAULT_SYSTEM_PROMPT},
     conversations::{ConversationLibrary, SearchHit},
     engines::{load_with_fallback, reasoning_levels, shipped_packs, shipped_pins, EngineSource, EngineStore, LlamaServer, RunSettings, Variant},
     environment::EnvironmentStore,
@@ -478,16 +478,18 @@ fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, mode
     config.top_p = model.settings.top_p;
     config.reasoning = reasoning_static(reasoning);
     config.images = images;
+    config.context_tokens = model.settings.context;
     // Pause and ask: the user has APPROVAL_SECONDS to answer, or the turn ends.
     let approve_chat = chat.to_owned();
     let approve_cancel = cancel.clone();
-    let approve = move |what: &str, folder: &str| -> bool {
+    let approve = move |ask: &Approval| -> bool {
+        let folder = ask.folder.clone().unwrap_or_default();
         let id = new_id('h');
         let (tx, rx) = mpsc::channel();
         if let Ok(mut a) = APPROVALS.lock() {
             a.insert(id.clone(), tx);
         }
-        let _ = app.emit("chat-event", json!({"chat": approve_chat, "type": "approval", "id": id, "what": what, "folder": folder, "seconds": APPROVAL_SECONDS}));
+        let _ = app.emit("chat-event", json!({"chat": approve_chat, "type": "approval", "id": id, "what": ask.what, "folder": ask.folder, "detail": ask.detail, "reason": ask.reason, "seconds": APPROVAL_SECONDS}));
         let deadline = Instant::now() + Duration::from_secs(APPROVAL_SECONDS);
         let answer = loop {
             if approve_cancel.is_cancelled() {
@@ -503,9 +505,11 @@ fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, mode
             a.remove(&id);
         }
         let ok = answer == "once" || answer == "always";
-        if answer == "always" {
+        if ask.folder.is_none() {
+            // An action held by the origin gate: core records the approval.
+        } else if answer == "always" {
             let _ = base.instruction(&format!("Allow Lu to work in {folder}"));
-            let _ = base.catalog.allow_folder(Path::new(folder));
+            let _ = base.catalog.allow_folder(Path::new(&folder));
         } else if ok {
             let _ = base.instruction(&format!("Allow Lu to work in {folder} for this answer"));
         }
@@ -530,7 +534,7 @@ fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, mode
                 ChatEvent::ActionFinished { ok, what, .. } => json!({"chat": chat_id, "type": "action-done", "ok": ok, "text": what}),
                 ChatEvent::Held { what, folder, .. } => match folder {
                     Some(f) => json!({"chat": chat_id, "type": "held", "folder": f, "text": format!("{what} needs a folder Lu has not been allowed to work in: {f}")}),
-                    None => json!({"chat": chat_id, "type": "held", "text": format!("{what} is waiting for your OK. Reply to approve it.")}),
+                    None => json!({"chat": chat_id, "type": "held", "text": format!("{what} was not done: it came after reading outside content.")}),
                 },
                 ChatEvent::Done => json!({"chat": chat_id, "type": "done"}),
             };
