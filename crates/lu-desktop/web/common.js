@@ -150,7 +150,12 @@ export function renderReply(text, into) {
       while (i < lines.length && !lines[i].startsWith("```")) code.push(lines[i++]);
       const closed = i < lines.length;
       i++;
-      if (lang === "chart") {
+      // Chart data in a plain or json block counts too (models drop the word).
+      let isChart = lang === "chart";
+      if (!isChart && closed && (lang === "" || lang === "json")) {
+        try { const o = JSON.parse(code.join("\n")); isChart = !!o && typeof o === "object" && !Array.isArray(o) && Array.isArray(o.series) && ["bar", "line", "area", "pie", "scatter"].includes(String(o.type).toLowerCase()); } catch {}
+      }
+      if (isChart) {
         // Still streaming: a placeholder, not half-written JSON.
         if (!closed) { into.append(el("div", { class: "chart chart-wait", text: "Drawing a chart…" })); continue; }
         try { into.append(drawChart(parseChart(code.join("\n")))); }

@@ -161,6 +161,12 @@ impl Catalog {
         Ok(())
     }
 
+    /// Pair a model with its image support file.
+    pub fn set_projector(&self, id: i64, projector: &Path) -> Result<(), String> {
+        self.db()?.execute("UPDATE models SET projector = ?2 WHERE id = ?1", params![id, projector.to_string_lossy()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn rename(&self, id: i64, name: &str) -> Result<(), String> {
         let n = name.trim();
         if n.is_empty() {
@@ -227,6 +233,25 @@ impl Catalog {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// The image support file (mmproj) next to a model, as LM Studio keeps them.
+pub fn sibling_projector(model: &Path) -> Option<PathBuf> {
+    let dir = model.parent()?;
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf")) && p.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().contains("mmproj")))
+        .filter(|p| lu_core::gguf::inspect(p).is_ok_and(|i| i.is_projector()))
+        .collect();
+    // Prefer the most precise one (F32 > BF16 > F16 > the rest) when several sit there.
+    let rank = |p: &PathBuf| {
+        let n = p.to_string_lossy().to_ascii_lowercase();
+        if n.contains("f32") { 0 } else if n.contains("bf16") { 1 } else if n.contains("f16") { 2 } else { 3 }
+    };
+    found.sort_by_key(rank);
+    found.into_iter().next()
 }
 
 /// GGUF files under a folder (LM Studio's model folder, for example),

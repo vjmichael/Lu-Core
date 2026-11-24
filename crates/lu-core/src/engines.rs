@@ -1466,6 +1466,8 @@ impl LlamaServer {
         let mut reply = ChatReply { content: String::new(), tool_calls: Vec::new(), finish_reason: "stop".into(), prompt_tokens_per_second: None, tokens_per_second: None };
         let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
         let mut guard = crate::loop_guard::StreamLoopGuard::default();
+        let mut reasoning_chars = 0usize;
+        let mut saw_done = false;
         let mut line = String::new();
         loop {
             if stopped() {
@@ -1488,6 +1490,7 @@ impl LlamaServer {
             }
             let Some(data) = line.trim_end().strip_prefix("data: ") else { continue };
             if data == "[DONE]" {
+                saw_done = true;
                 break;
             }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
@@ -1500,6 +1503,9 @@ impl LlamaServer {
                 reply.finish_reason = f.to_owned();
             }
             let Some(delta) = choice.get("delta") else { continue };
+            if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                reasoning_chars += r.chars().count();
+            }
             if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
                 if !text.is_empty() {
                     if guard.observe_chunk(text) != crate::loop_guard::StreamLoopVerdict::Continue {
@@ -1525,6 +1531,20 @@ impl LlamaServer {
                     }
                 }
             }
+        }
+        // One line per reply in the engine's log, so a short or cut answer
+        // can be traced to how it ended (no message text is written).
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                f,
+                "lu reply: finish={} done={} content_chars={} reasoning_chars={} tool_calls={}",
+                reply.finish_reason,
+                saw_done,
+                reply.content.chars().count(),
+                reasoning_chars,
+                calls.len()
+            );
         }
         reply.tool_calls = calls.into_values().enumerate().map(|(i, mut c)| {
             if c.id.is_empty() {

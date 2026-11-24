@@ -25,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use catalog::{find_gguf, Catalog, ModelEntry, ModelSettings};
+use catalog::{find_gguf, sibling_projector, Catalog, ModelEntry, ModelSettings};
 use lu_core::{
     ansf::AnsfStore,
     ansf_live_chat::{LiveEvent, LiveKind},
@@ -197,7 +197,17 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                     let _ = lu_core::resources::Engine::unload(&mut e);
                 }
                 let model = match base.catalog.get(id) {
-                    Ok(m) => m,
+                    // An imported model whose image support file sits next to it: pair them.
+                    Ok(mut m) => {
+                        if m.projector.is_none() {
+                            if let Some(p) = sibling_projector(Path::new(&m.path)) {
+                                if base.catalog.set_projector(id, &p).is_ok() {
+                                    m.projector = Some(p.to_string_lossy().into_owned());
+                                }
+                            }
+                        }
+                        m
+                    }
                     Err(e) => {
                         set_status(&app, &status, |s| *s = ModelStatus { state: "error".into(), message: Some(e), ..Default::default() });
                         continue;
@@ -641,7 +651,7 @@ fn import_model(app: State<App>, path: String) -> R<i64> {
         return Err("This file is a draft head for faster generation (MTP). It only works next to its main model and cannot be loaded on its own.".into());
     }
     let name = info.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-    app.base.catalog.add(&p, &name, info.architecture.as_deref(), info.context_length, info.file_bytes, "imported", None, None)
+    app.base.catalog.add(&p, &name, info.architecture.as_deref(), info.context_length, info.file_bytes, "imported", None, sibling_projector(&p).as_deref())
 }
 
 /// Model files found in LM Studio's folder (or another folder), to import.
