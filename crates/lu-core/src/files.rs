@@ -332,6 +332,11 @@ pub struct FileAccess<'a> {
 }
 
 impl<'a> FileAccess<'a> {
+    /// The origin gate this access reports to.
+    pub fn gate(&self) -> &'a OriginGate {
+        self.gate
+    }
+
     /// The user allowed one more folder during this turn.
     pub fn allow_folder(&self, folder: &Path) -> Result<(), FileError> {
         let root = resolve(folder)?;

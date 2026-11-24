@@ -420,7 +420,7 @@ fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, mode
         let _ = app.emit("chat-event", json!({"chat": approve_chat, "type": "approval-done", "id": id, "answer": answer}));
         ok
     };
-    let lp = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: Some(&base.environment), profile: None, config, cancel, approve: Some(&approve) };
+    let lp = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: Some(&base.environment), profile: None, config, cancel, approve: Some(&approve), web: None, links: Default::default() };
     let chat_id = chat.to_owned();
     if let Ok(mut l) = LIVE.lock() {
         l.insert(chat_id.clone(), String::new());

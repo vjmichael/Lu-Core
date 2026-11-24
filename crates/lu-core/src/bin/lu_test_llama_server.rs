@@ -144,14 +144,22 @@ fn chat(s: &mut std::net::TcpStream, body: &[u8]) {
     };
     let text_chunk = |t: &str| serde_json::json!({"choices":[{"index":0,"delta":{"content":t},"finish_reason":null}]});
     let finish = |reason: &str| serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"timings":{"prompt_per_second":310.0,"predicted_per_second":42.5}});
-    let content = last["content"].as_str().unwrap_or("").to_owned();
-    if last["role"] == "tool" {
+    let mut content = last["content"].as_str().unwrap_or("").to_owned();
+    // "TOOL:a:{..} then TOOL:b:{..}": after the first result, call the second.
+    let user = messages.iter().rev().find(|m| m["role"] == "user").and_then(|m| m["content"].as_str()).unwrap_or("").to_owned();
+    let results_since = messages.iter().rev().take_while(|m| m["role"] != "user").filter(|m| m["role"] == "tool").count();
+    let second = user.split(" then ").nth(1).filter(|_| last["role"] == "tool" && results_since == 1).map(str::to_owned);
+    if let Some(next) = second {
+        content = next;
+    }
+    if last["role"] == "tool" && !content.contains("TOOL:") {
         let short: String = content.chars().take(60).collect();
         for piece in ["Tool ", "said: ", &short] {
             send(s, text_chunk(piece));
         }
         send(s, finish("stop"));
     } else if let Some(rest) = content.split("TOOL:").nth(1) {
+        let rest = rest.split(" then ").next().unwrap_or(rest);
         let (name, args) = rest.split_once(':').unwrap_or((rest, "{}"));
         let call = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":name.trim(),"arguments":""}}]},"finish_reason":null}]});
         send(s, call);

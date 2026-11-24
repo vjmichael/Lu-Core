@@ -116,7 +116,7 @@ fn run() -> Result<(), String> {
         eprintln!("(skipped {f})");
     }
     eprintln!("Ready on {} {}. Workspace: {}. Type /quit to leave.\n", engine.build.variant.as_str(), engine.build.version, workspace.display());
-    let chat = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: Some(&env), profile: None, config: ChatConfig::new(&workspace), cancel: Default::default(), approve: None };
+    let chat = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: Some(&env), profile: None, config: ChatConfig::new(&workspace), cancel: Default::default(), approve: None, web: None, links: Default::default() };
     let stdin = io::stdin();
     loop {
         eprint!("you> ");

@@ -35,3 +35,4 @@ pub mod dx;
 pub mod chat;
 pub mod conversations;
 pub mod utilities;
+pub mod web;
