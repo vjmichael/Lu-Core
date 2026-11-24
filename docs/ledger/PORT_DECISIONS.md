@@ -93,3 +93,11 @@ Reviewed, not ported: Lu-AI-GUI src-tauri/lu-core/src/persistent_llama_backend.r
 New `engines.rs`: pinned upstream llama.cpp release builds (pins/llama-engines.json, b12651, SHA-256 from GitHub's published digests, read 2026-11-23) for CPU, Vulkan and ROCm on Windows and Linux x64. Staged install with resume, hash check, archive.rs extraction, `--version` smoke test, SQLite registry, activate/rollback, per-model pins and backend results (load time, tokens/s, failure reason), backend order (pin, last success, ROCm, Vulkan, CPU; last failure last), fallback loading, crash detection. LlamaServer implements resources::Engine so the model owner is the only loader.
 
 Test double: src/bin/lu_test_llama_server.rs answers llama-server's command line, /health and /completion for CI; it is not used outside tests.
+
+## ROCm runtime pack (owner decision, Nov 23: Lu ships what it needs)
+
+llama.cpp's Windows ROCm builds (`win-rocm-10.0`, every release since at least mid-September 2026) bundle the HIP runtime (amdhip64_7.dll, amd_comgr.dll, rocm_kpack.dll) and gfx1201 code in ggml-hip.dll, but ggml-hip.dll imports hipblas.dll, which is not included; without it the GPU module does not load and llama.cpp silently uses the CPU (seen on the owner's R9700: 2 tokens/s, GPU at 0%).
+
+Source: AMD's stable ROCm Core tarball `therock-dist-windows-gfx120X-all-10.0.0.tar.gz` (2,282,922,923 bytes) from https://stable.repo.amd.com/rocm/core/tarball/. AMD publishes no SHA-256; Lu computed `75da73c483cbc0456d9008f2079b333f4f9d3b7744705378ff8007e502ca38c5` on 2026-11-23 after a download whose size matched the server's Content-Length. Pin list: `crates/lu-core/pins/rocm-runtime.json`.
+
+Pack `rocm-10.0.0-gfx120X` (806 files, 492 MB): hipblas.dll -> rocsolver.dll, rocblas.dll -> libhipblaslt.dll -> origami.dll (import chain read from the DLLs), rocBLAS and hipBLASLt kernels for gfx1200/gfx1201 only, and licences (MIT; rocSOLVER BSD-2-Clause), each file pinned by SHA-256. The HIP runtime itself comes from the llama.cpp build. Other AMD GPU families need their own pack from the matching TheRock tarball (not yet pinned).

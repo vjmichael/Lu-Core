@@ -29,6 +29,7 @@
 //! pinned list and SQLite registry), compute_runtime.rs.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     net::TcpListener,
@@ -95,6 +96,83 @@ impl Pin {
 struct PinFile {
     schema: String,
     builds: Vec<Pin>,
+}
+
+pub const PACKS_JSON: &str = include_str!("../pins/rocm-runtime.json");
+
+/// One file a runtime pack takes from its source.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PackFile {
+    /// Path inside the source archive, e.g. `bin/rocblas.dll`.
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PackSource {
+    pub url: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// Libraries an engine build needs but does not include (for ROCm builds:
+/// hipBLAS, rocBLAS and friends with their GPU kernels), taken file by file
+/// from a pinned upstream archive so Lu runs out of the box.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RuntimePack {
+    pub name: String,
+    /// The engine variant it serves.
+    #[serde(rename = "for")]
+    pub for_variant: Variant,
+    pub platform: String,
+    /// GPU architectures its kernels cover.
+    pub gfx: Vec<String>,
+    /// GPU names (as the driver reports them) this pack is for.
+    pub gpu_names: Vec<String>,
+    pub source: PackSource,
+    pub files: Vec<PackFile>,
+}
+impl RuntimePack {
+    /// Total size of the files it installs.
+    pub fn installed_bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.bytes).sum()
+    }
+    /// Whether this pack serves a GPU with this name.
+    pub fn serves(&self, gpu_name: &str) -> bool {
+        let g = gpu_name.to_ascii_lowercase();
+        self.gpu_names.iter().any(|n| g.contains(&n.to_ascii_lowercase()))
+    }
+}
+
+#[derive(Deserialize)]
+struct PackPinFile {
+    schema: String,
+    packs: Vec<RuntimePack>,
+}
+
+/// Parse a runtime-pack pin list (JSON at the edge); keep valid entries.
+pub fn parse_packs(json: &str) -> Result<Vec<RuntimePack>, EngineError> {
+    let file: PackPinFile = serde_json::from_str(json).map_err(|e| EngineError::Invalid(format!("pack list: {e}")))?;
+    if file.schema != "lu-runtime-packs-v1" {
+        return Err(EngineError::Invalid(format!("pack list schema {}", file.schema)));
+    }
+    let hex64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    Ok(file
+        .packs
+        .into_iter()
+        .filter(|p| {
+            hex64(&p.source.sha256)
+                && !p.files.is_empty()
+                && p.name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                && p.files.iter().all(|f| hex64(&f.sha256) && crate::archive::safe_relative(&f.path).is_ok())
+        })
+        .collect())
+}
+
+/// The runtime packs shipped with Lu for this platform.
+pub fn shipped_packs() -> Vec<RuntimePack> {
+    parse_packs(PACKS_JSON).unwrap_or_default().into_iter().filter(|p| p.platform == platform()).collect()
 }
 
 /// This machine's platform name in the pin list.
@@ -197,6 +275,13 @@ pub struct BackendRecord {
 
 // ---------------------------------------------------------------- downloads
 
+/// AMD's ROCm download server (runtime pack sources).
+fn amd_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    host == "stable.repo.amd.com" || host == "repo.radeon.com"
+}
+
 fn github_host(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else { return false };
     let host = rest.split(['/', '?', '#']).next().unwrap_or("").to_ascii_lowercase();
@@ -227,25 +312,38 @@ impl EngineSource {
         }
     }
     fn allowed(&self, url: &str) -> bool {
-        self.local_base.as_ref().is_some_and(|b| url.starts_with(b.as_str())) || github_host(url)
+        self.local_base.as_ref().is_some_and(|b| url.starts_with(b.as_str())) || github_host(url) || amd_host(url)
+    }
+    /// Where a runtime pack's source tarball is fetched from.
+    fn pack_url(&self, pack: &RuntimePack) -> String {
+        match &self.local_base {
+            Some(b) => format!("{b}/packs/{}", pack.source.url.rsplit('/').next().unwrap_or("pack.tar.gz")),
+            None => pack.source.url.clone(),
+        }
     }
     /// Download `pin` to `part`, resuming, checking size and SHA-256.
     fn fetch(&self, pin: &Pin, part: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64)) -> Result<(), EngineError> {
+        self.fetch_file(&self.url(pin), &pin.asset, pin.bytes, &pin.sha256, part, cancel, progress)
+    }
+
+    /// Download a pinned file to `part`, resuming, checking size and SHA-256.
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_file(&self, first_url: &str, label: &str, bytes: u64, sha256: &str, part: &Path, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64)) -> Result<(), EngineError> {
         let have = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
-        if have > pin.bytes {
+        if have > bytes {
             fs::remove_file(part)?;
         }
-        let have = have.min(pin.bytes);
+        let have = have.min(bytes);
         let mut hasher = Sha256::new();
         let mut done = 0u64;
-        let mut out = if have == pin.bytes {
+        let mut out = if have == bytes {
             None
         } else {
-            let mut url = self.url(pin);
+            let mut url = first_url.to_owned();
             let mut resp = None;
             for _ in 0..6 {
                 if !self.allowed(&url) {
-                    return Err(EngineError::Invalid(format!("refused to download from {url}: not GitHub")));
+                    return Err(EngineError::Invalid(format!("refused to download from {url}: not GitHub or AMD's ROCm server")));
                 }
                 let mut req = self.agent.get(&url);
                 if have > 0 {
@@ -278,7 +376,7 @@ impl EngineSource {
                     OpenOptions::new().append(true).open(part)?
                 }
                 200 => File::create(part)?,
-                s => return Err(EngineError::Network(format!("GitHub answered {s} for {}", pin.asset))),
+                s => return Err(EngineError::Network(format!("GitHub answered {s} for {}", label))),
             };
             Some((file, resp.into_body().into_reader()))
         };
@@ -294,14 +392,14 @@ impl EngineSource {
                     break;
                 }
                 done += k as u64;
-                if done > pin.bytes {
+                if done > bytes {
                     drop(out);
                     fs::remove_file(part)?;
-                    return Err(EngineError::Invalid(format!("{} is larger than pinned", pin.asset)));
+                    return Err(EngineError::Invalid(format!("{} is larger than pinned", label)));
                 }
                 file.write_all(&buf[..k])?;
                 hasher.update(&buf[..k]);
-                progress(done, pin.bytes);
+                progress(done, bytes);
             }
             file.sync_all()?;
         } else {
@@ -317,13 +415,13 @@ impl EngineSource {
             }
         }
         drop(out);
-        if done != pin.bytes {
-            return Err(EngineError::Network(format!("{} stopped at {done} of {} bytes (the staged part is kept; it will resume)", pin.asset, pin.bytes)));
+        if done != bytes {
+            return Err(EngineError::Network(format!("{} stopped at {done} of {} bytes (the staged part is kept; it will resume)", label, bytes)));
         }
         let actual = format!("{:x}", hasher.finalize());
-        if actual != pin.sha256 {
+        if actual != sha256 {
             fs::remove_file(part)?;
-            return Err(EngineError::HashMismatch { expected: pin.sha256.clone(), actual });
+            return Err(EngineError::HashMismatch { expected: sha256.to_owned(), actual });
         }
         Ok(())
     }
@@ -365,9 +463,10 @@ fn find_server(dir: &Path, depth: usize) -> Option<PathBuf> {
 
 /// Run the server with `args` in an owned process tree (60 s limit) and
 /// return whether it succeeded and everything it printed.
-fn run_capture(server: &Path, args: &[&str]) -> Result<(bool, String), String> {
+fn run_capture(server: &Path, args: &[&str], lib_dirs: &[PathBuf]) -> Result<(bool, String), String> {
     let mut cmd = Command::new(server);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    add_lib_dirs(&mut cmd, lib_dirs);
     if let Some(dir) = server.parent() {
         cmd.current_dir(dir);
     }
@@ -404,9 +503,25 @@ fn run_capture(server: &Path, args: &[&str]) -> Result<(bool, String), String> {
     Ok((status.success(), text))
 }
 
+/// Put runtime-pack folders first on a process's library search path
+/// (`PATH` on Windows, `LD_LIBRARY_PATH` elsewhere).
+fn add_lib_dirs(cmd: &mut Command, lib_dirs: &[PathBuf]) {
+    if lib_dirs.is_empty() {
+        return;
+    }
+    let var = if cfg!(windows) { "PATH" } else { "LD_LIBRARY_PATH" };
+    let mut dirs: Vec<PathBuf> = lib_dirs.to_vec();
+    if let Some(old) = std::env::var_os(var) {
+        dirs.extend(std::env::split_paths(&old));
+    }
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        cmd.env(var, joined);
+    }
+}
+
 /// Run `server --version`; its version line.
 fn smoke(server: &Path) -> Result<String, String> {
-    let (ok, text) = run_capture(server, &["--version"])?;
+    let (ok, text) = run_capture(server, &["--version"], &[])?;
     let line = text.lines().find(|l| l.to_ascii_lowercase().contains("version")).map(str::to_owned);
     match (ok, line) {
         (true, Some(l)) => Ok(l.trim().to_owned()),
@@ -417,8 +532,8 @@ fn smoke(server: &Path) -> Result<String, String> {
 /// The devices a build can use, from `llama-server --list-devices`
 /// (lines like `ROCm0: AMD Radeon AI PRO R9700 (32624 MiB, 32000 MiB free)`).
 /// Returns the device lines and the full output, for reporting.
-pub fn list_devices(server: &Path) -> Result<(Vec<String>, String), String> {
-    let (_, text) = run_capture(server, &["--list-devices"])?;
+pub fn list_devices(server: &Path, lib_dirs: &[PathBuf]) -> Result<(Vec<String>, String), String> {
+    let (_, text) = run_capture(server, &["--list-devices"], lib_dirs)?;
     let mut devices = Vec::new();
     let mut in_list = false;
     for line in text.lines() {
@@ -479,6 +594,11 @@ impl<'a> EngineStore<'a> {
                 installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 activated_seq INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(variant, version)
+            );
+            CREATE TABLE IF NOT EXISTS lu_runtime_packs (
+                name TEXT PRIMARY KEY NOT NULL, variant TEXT NOT NULL, dir TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL, files INTEGER NOT NULL,
+                installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS lu_model_engine_pins (
                 model TEXT PRIMARY KEY NOT NULL, variant TEXT NOT NULL, version TEXT
@@ -625,7 +745,8 @@ impl<'a> EngineStore<'a> {
         let version_line = smoke(&server).map_err(|why| fail(EngineError::SmokeFailed(why), &unpacked))?;
         // A GPU build that sees no GPU here is not installed: it would only
         // run on the CPU while claiming to be ROCm or Vulkan.
-        let (devices, listing) = list_devices(&server).map_err(|why| fail(EngineError::SmokeFailed(why), &unpacked))?;
+        let lib_dirs = self.runtime_dirs(pin.variant)?;
+        let (devices, listing) = list_devices(&server, &lib_dirs).map_err(|why| fail(EngineError::SmokeFailed(why), &unpacked))?;
         if pin.variant.uses_gpu() && gpu_devices(&devices).is_empty() {
             let lines: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
             let shown = lines[lines.len().saturating_sub(12)..].join(" | ");
@@ -659,6 +780,175 @@ impl<'a> EngineStore<'a> {
             self.activate(pin.variant, &pin.version)?;
         }
         self.build(pin.variant, &pin.version)?.ok_or_else(|| EngineError::Database("build vanished".into()))
+    }
+
+    /// Installed runtime packs: (name, variant, folder).
+    pub fn installed_packs(&self) -> Result<Vec<(String, Variant, PathBuf)>, EngineError> {
+        let db = self.db()?;
+        let mut q = db.prepare("SELECT name, variant, dir FROM lu_runtime_packs ORDER BY name")?;
+        let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (name, v, dir) = row?;
+            if let Some(variant) = Variant::parse(&v) {
+                out.push((name, variant, PathBuf::from(dir)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Library folders of the installed packs for a variant, for the
+    /// engine's search path.
+    pub fn runtime_dirs(&self, variant: Variant) -> Result<Vec<PathBuf>, EngineError> {
+        Ok(self.installed_packs()?.into_iter().filter(|(_, v, _)| *v == variant).map(|(_, _, d)| d.join("bin")).collect())
+    }
+
+    fn pack_summary(pack: &RuntimePack) -> String {
+        format!("install runtime pack {} ({} files, {} MB, from {})", pack.name, pack.files.len(), pack.installed_bytes() / 1_000_000, pack.source.url)
+    }
+
+    /// Install a runtime pack (the user's instruction; the origin gate
+    /// decides). `preloaded` is a copy of the source archive already on
+    /// this machine (an installer or an earlier download); it is used only
+    /// if its size and SHA-256 match the pin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_pack(&self, call_id: &str, turn_id: &str, pack: &RuntimePack, preloaded: Option<&Path>, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf, EngineError> {
+        let proposal = Proposal { session_id: self.recorder.session_id().to_owned(), turn_id: turn_id.to_owned(), call_id: call_id.to_owned(), effect: EffectKind::Install, text: Self::pack_summary(pack) };
+        match self.gate.decide(self.recorder.book(), &proposal).map_err(|e| EngineError::Database(format!("{e:?}")))? {
+            Decision::Run => {}
+            Decision::Hold { held_id, notify, .. } => return Err(EngineError::Held { held_id, notify_user: notify }),
+            Decision::Refuse { source } => return Err(EngineError::Invalid(format!("refused: asked for by {}", source.reference))),
+        }
+        self.install_pack_unchecked(call_id, turn_id, pack, preloaded, cancel, progress)
+    }
+
+    /// Install a held runtime pack after the user approved it in a later message.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_pack_approved(&self, held_id: i64, approving_turn: &str, call_id: &str, pack: &RuntimePack, preloaded: Option<&Path>, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf, EngineError> {
+        let held = self.gate.held(held_id).map_err(|e| EngineError::Database(format!("{e:?}")))?.ok_or_else(|| EngineError::Invalid("no such held action".into()))?;
+        if held.effect != EffectKind::Install || held.text != Self::pack_summary(pack) {
+            return Err(EngineError::Invalid("the approval is for a different action".into()));
+        }
+        self.gate.decide_held(self.recorder.book(), held_id, approving_turn, true).map_err(|e| EngineError::Invalid(format!("approval not accepted: {e:?}")))?;
+        self.install_pack_unchecked(call_id, approving_turn, pack, preloaded, cancel, progress)
+    }
+
+    fn install_pack_unchecked(&self, call_id: &str, turn_id: &str, pack: &RuntimePack, preloaded: Option<&Path>, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf, EngineError> {
+        if let Some((_, _, dir)) = self.installed_packs()?.into_iter().find(|(n, _, _)| n == &pack.name) {
+            return Ok(dir);
+        }
+        let part = self.root.join(".staging").join(format!("{}.source", pack.name));
+        let have = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        let copy = preloaded.filter(|p| fs::metadata(p).ok().map(|m| m.len()) == Some(pack.source.bytes) && have < pack.source.bytes);
+        // Room for the source archive (unless already here) and the files.
+        let download = if copy.is_some() || have == pack.source.bytes { 0 } else { pack.source.bytes - have };
+        let need = Need { disk_mib: (download + pack.source.bytes * u64::from(copy.is_some()) + pack.installed_bytes()).div_ceil(1024 * 1024), disk_path: Some(self.root.clone()), ..Need::default() };
+        match self.governor.admit(&Self::pack_summary(pack), &need).map_err(|e| EngineError::Database(format!("{e:?}")))? {
+            Admission::Admit => {}
+            Admission::Refuse(w) | Admission::Unmeasured(w) => return Err(EngineError::NoRoom(w)),
+        }
+        self.recorder
+            .begin_command(&crate::ansf_operations::CommandStart { call_id: call_id.to_owned(), turn_id: turn_id.to_owned(), command: Self::pack_summary(pack), cwd: self.root.to_string_lossy().into_owned() })
+            .map_err(|e| EngineError::Database(format!("{e:?}")))?;
+        let started = Instant::now();
+        let result = (|| {
+            if let Some(src) = copy {
+                fs::copy(src, &part)?;
+            }
+            self.source.fetch_file(&self.source.pack_url(pack), &pack.name, pack.source.bytes, &pack.source.sha256, &part, cancel, progress)?;
+            let dir = self.extract_pack(pack, &part)?;
+            // The source archive is large and no longer needed.
+            let _ = fs::remove_file(&part);
+            Ok(dir)
+        })();
+        let (code, output) = match &result {
+            Ok(d) => (Some(0), format!("installed {} ({} files) at {}", pack.name, pack.files.len(), d.display())),
+            Err(EngineError::Cancelled) => (None, "cancelled; the staged download is kept".into()),
+            Err(e) => (Some(1), format!("not installed: {e}")),
+        };
+        self.recorder
+            .finish_command(&crate::ansf_operations::CommandFinish {
+                call_id: call_id.to_owned(),
+                exit_code: code,
+                timed_out: false,
+                cancelled: matches!(result, Err(EngineError::Cancelled)),
+                duration_ms: started.elapsed().as_millis() as u64,
+                output,
+            })
+            .map_err(|e| EngineError::Database(format!("{e:?}")))?;
+        result
+    }
+
+    /// Take exactly the pinned files out of the source archive, checking
+    /// each one's size and SHA-256, then move the pack into place.
+    fn extract_pack(&self, pack: &RuntimePack, source: &Path) -> Result<PathBuf, EngineError> {
+        let staging = self.root.join(".staging").join(format!("{}-unpacked", pack.name));
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
+        let fail = |e: EngineError| {
+            let _ = fs::remove_dir_all(&staging);
+            e
+        };
+        let wanted: BTreeMap<&str, &PackFile> = pack.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        let mut done: BTreeSet<String> = BTreeSet::new();
+        let reader = flate2::read::MultiGzDecoder::new(std::io::BufReader::new(File::open(source)?));
+        let mut tar = tar::Archive::new(reader);
+        let entries = tar.entries().map_err(|e| fail(EngineError::Invalid(format!("pack source: {e}"))))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|e| fail(EngineError::Invalid(format!("pack source: {e}"))))?;
+            let raw = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
+            let name = raw.strip_prefix("./").unwrap_or(&raw).to_owned();
+            let Some(file) = wanted.get(name.as_str()) else { continue };
+            if entry.header().entry_type() != tar::EntryType::Regular {
+                return Err(fail(EngineError::Invalid(format!("{name} is not a plain file in the source"))));
+            }
+            let parts = crate::archive::safe_relative(&name).map_err(|why| fail(EngineError::Invalid(format!("{name}: {why}"))))?;
+            let target = parts.iter().fold(staging.clone(), |p, c| p.join(c));
+            fs::create_dir_all(target.parent().unwrap_or(&staging)).map_err(|e| fail(e.into()))?;
+            let mut out = File::create(&target).map_err(|e| fail(e.into()))?;
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            let mut n = 0u64;
+            loop {
+                let k = entry.read(&mut buf).map_err(|e| fail(EngineError::Invalid(format!("{name}: {e}"))))?;
+                if k == 0 {
+                    break;
+                }
+                n += k as u64;
+                if n > file.bytes {
+                    return Err(fail(EngineError::Invalid(format!("{name} is larger than pinned"))));
+                }
+                out.write_all(&buf[..k]).map_err(|e| fail(e.into()))?;
+                hasher.update(&buf[..k]);
+            }
+            out.sync_all().map_err(|e| fail(e.into()))?;
+            let actual = format!("{:x}", hasher.finalize());
+            if n != file.bytes || actual != file.sha256 {
+                return Err(fail(EngineError::HashMismatch { expected: format!("{} {}", file.path, file.sha256), actual }));
+            }
+            done.insert(name);
+        }
+        let missing: Vec<&str> = pack.files.iter().map(|f| f.path.as_str()).filter(|p| !done.contains(*p)).collect();
+        if !missing.is_empty() {
+            return Err(fail(EngineError::Invalid(format!("the source lacks {} pinned file(s), e.g. {}", missing.len(), missing[0]))));
+        }
+        let dir = self.root.join("runtime").join(&pack.name);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        fs::create_dir_all(dir.parent().unwrap_or(&self.root))?;
+        fs::rename(&staging, &dir)?;
+        let source = Source { kind: SourceKind::RemoteService, reference: pack.source.url.clone() };
+        for f in pack.files.iter().filter(|f| f.path.to_ascii_lowercase().ends_with(".dll") || f.path.to_ascii_lowercase().ends_with(".so")) {
+            let p = f.path.split('/').fold(dir.clone(), |p, c| p.join(c));
+            self.gate.mark_external_file(&p, &source).map_err(|e| EngineError::Database(format!("{e:?}")))?;
+        }
+        self.db()?.execute(
+            "INSERT INTO lu_runtime_packs(name, variant, dir, source_sha256, files) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![pack.name, pack.for_variant.as_str(), dir.to_string_lossy(), pack.source.sha256, pack.files.len() as i64],
+        )?;
+        Ok(dir)
     }
 
     /// Make an installed version the active one for its variant.
@@ -810,10 +1100,12 @@ pub struct RunSettings {
     pub projector: Option<PathBuf>,
     /// How long a load may take before it is given up.
     pub load_timeout: Duration,
+    /// Runtime-pack folders put first on the engine's library search path.
+    pub lib_dirs: Vec<PathBuf>,
 }
 impl Default for RunSettings {
     fn default() -> Self {
-        Self { context: 8192, gpu_layers: None, threads: None, projector: None, load_timeout: Duration::from_secs(600) }
+        Self { context: 8192, gpu_layers: None, threads: None, projector: None, load_timeout: Duration::from_secs(600), lib_dirs: Vec::new() }
     }
 }
 
@@ -934,6 +1226,7 @@ impl LlamaServer {
         if let Some(dir) = self.build.server.parent() {
             cmd.current_dir(dir);
         }
+        add_lib_dirs(&mut cmd, &self.settings.lib_dirs);
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file));
         let used_before = gpu_used_mib();
         let started = Instant::now();
@@ -1052,7 +1345,9 @@ pub fn load_with_fallback(store: &EngineStore<'_>, model: &str, gpu_present: boo
     for (build, _why) in order {
         let variant = build.variant;
         let version = build.version.clone();
-        let mut server = LlamaServer::new(build, settings.clone(), log_dir);
+        let mut settings = settings.clone();
+        settings.lib_dirs.extend(store.runtime_dirs(variant)?);
+        let mut server = LlamaServer::new(build, settings, log_dir);
         match server.start(model) {
             Ok(()) => {
                 let load_ms = server.load_ms();

@@ -527,9 +527,9 @@ pub fn dependency_check(build: &EngineBuild, extra_dirs: &[PathBuf]) -> Finding 
 }
 
 /// Ask a build which devices it can use (starts the build briefly).
-pub fn device_check(build: &EngineBuild) -> Finding {
+pub fn device_check(build: &EngineBuild, lib_dirs: &[PathBuf]) -> Finding {
     let name = format!("{} {}", build.variant.as_str(), build.version);
-    match list_devices(&build.server) {
+    match list_devices(&build.server, lib_dirs) {
         Ok((devices, output)) => {
             let gpus: Vec<&String> = devices.iter().filter(|d| !d.to_ascii_uppercase().starts_with("CPU")).collect();
             let mut f = if build.variant.uses_gpu() && gpus.is_empty() {

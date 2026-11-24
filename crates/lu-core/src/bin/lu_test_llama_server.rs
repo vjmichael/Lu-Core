@@ -11,7 +11,9 @@
 //! - `NO_DEVICES`: `--list-devices` shows no GPU (a GPU build that cannot
 //!   see this machine's GPU);
 //! - `CPU_ONLY`: loads, but reports 0 layers offloaded (llama.cpp's quiet
-//!   fall back to the CPU).
+//!   fall back to the CPU);
+//! - `NEEDS_HIPBLAS`: like llama.cpp's ROCm build, finds no GPU unless a
+//!   folder on its library search path holds `hipblas.dll`.
 //!
 //! `--version` prints a version line like the real server.
 
@@ -32,9 +34,12 @@ fn main() {
         println!("built with lu test for {}", env::consts::OS);
         return;
     }
+    let var = if cfg!(windows) { "PATH" } else { "LD_LIBRARY_PATH" };
+    let has_hipblas = env::var_os(var).is_some_and(|v| env::split_paths(&v).any(|d| d.join("hipblas.dll").is_file()));
+    let gpu_visible = !here.join("NO_DEVICES").exists() && (!here.join("NEEDS_HIPBLAS").exists() || has_hipblas);
     if args.iter().any(|a| a == "--list-devices") {
         println!("Available devices:");
-        if !here.join("NO_DEVICES").exists() {
+        if gpu_visible {
             println!("  TEST0: Lu Test GPU (8192 MiB, 8000 MiB free)");
         }
         return;
@@ -54,7 +59,7 @@ fn main() {
     }
     let crash_after_load = here.join("CRASH_AFTER_LOAD").exists();
     let layers: u32 = value("--n-gpu-layers").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let on_gpu = if here.join("CPU_ONLY").exists() { 0 } else { layers.min(33) };
+    let on_gpu = if here.join("CPU_ONLY").exists() || !gpu_visible { 0 } else { layers.min(33) };
     eprintln!("load_tensors: offloaded {on_gpu}/33 layers to GPU");
     let slow: u64 = fs::read_to_string(here.join("SLOW_LOAD_MS")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");

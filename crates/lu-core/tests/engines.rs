@@ -385,7 +385,7 @@ fn a_gpu_build_that_would_run_on_the_cpu_is_never_a_pass() {
     // One that lists a GPU but then loads with 0 layers on it is a failed
     // load, and Lu falls back to Vulkan instead of reporting a slow success.
     let rocm = store.install("e-2", &turn, &quiet_pin, true, &AtomicBool::new(false), &mut no_progress()).unwrap();
-    let (devices, _) = list_devices(&rocm.server).unwrap();
+    let (devices, _) = list_devices(&rocm.server, &[]).unwrap();
     assert_eq!(devices, ["TEST0: Lu Test GPU (8192 MiB, 8000 MiB free)"]);
     store.install("e-3", &turn, &vulkan_pin, true, &AtomicBool::new(false), &mut no_progress()).unwrap();
     let model = model_file(&lu.dir);
@@ -418,6 +418,27 @@ fn real_engine_install_and_load() {
     let pin = pins.iter().find(|p| p.variant == variant).expect("a pin for this platform").clone();
     let root = std::env::var("LU_TEST_ENGINE_DIR").map(PathBuf::from).unwrap_or_else(|_| lu.dir.join("engines"));
     let store = EngineStore::open(&root, pins, &src, &rec, &lu.gate, &gov).unwrap();
+    if variant == Variant::Rocm {
+        let gpus = lu_core::resources::measure(None).gpus;
+        let packs = lu_core::engines::shipped_packs();
+        let pack = packs
+            .iter()
+            .find(|p| gpus.iter().any(|g| p.serves(&g.name)))
+            .unwrap_or_else(|| panic!("no ROCm runtime pack serves {:?}; packs: {:?}", gpus.iter().map(|g| &g.name).collect::<Vec<_>>(), packs.iter().map(|p| &p.name).collect::<Vec<_>>()))
+            .clone();
+        let local = std::env::var("LU_TEST_ROCM_SOURCE").ok().map(PathBuf::from);
+        println!("installing runtime pack {} ({} MB){}", pack.name, pack.installed_bytes() / 1_000_000, if local.is_some() { " from the local copy" } else { " from AMD" });
+        let mut shown = 0;
+        let dir = store
+            .install_pack("p-1", &turn, &pack, local.as_deref(), &AtomicBool::new(false), &mut |d, t| {
+                if d * 10 / t != shown {
+                    shown = d * 10 / t;
+                    println!("{} {}%", pack.name, shown * 10);
+                }
+            })
+            .unwrap();
+        println!("runtime pack at {}", dir.display());
+    }
     let mut last = 0;
     let build = store
         .install("e-1", &turn, &pin, true, &AtomicBool::new(false), &mut |d, t| {
@@ -428,7 +449,7 @@ fn real_engine_install_and_load() {
         })
         .unwrap();
     println!("installed {} {} -> {}", build.variant.as_str(), build.version, build.server.display());
-    match list_devices(&build.server) {
+    match list_devices(&build.server, &store.runtime_dirs(build.variant).unwrap()) {
         Ok((devices, _)) => println!("devices this build sees: {devices:?}"),
         Err(e) => println!("could not list devices: {e}"),
     }
@@ -455,4 +476,127 @@ fn real_engine_install_and_load() {
         println!("reply: {:?} at {:?} tokens/s", c.text, c.tokens_per_second);
     }
     let _ = Mutex::new(());
+}
+
+/// A source tarball shaped like AMD's: the files a pack takes, plus others.
+fn pack_source() -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+    let wanted: Vec<(String, Vec<u8>)> = vec![
+        ("bin/hipblas.dll".into(), b"MZ hipblas".to_vec()),
+        ("bin/rocblas.dll".into(), b"MZ rocblas".to_vec()),
+        ("bin/rocblas/library/Kernels.so-000-gfx1201.hsaco".into(), vec![7u8; 4096]),
+        ("share/doc/rocblas/LICENSE.md".into(), b"MIT License".to_vec()),
+    ];
+    let mut b = tar::Builder::new(Vec::new());
+    let mut add = |name: &str, data: &[u8]| {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, format!("./{name}"), data).unwrap();
+    };
+    add("bin/MIOpen.dll", b"not taken");
+    for (n, d) in &wanted {
+        add(n, d);
+    }
+    add("bin/clinfo.exe", b"not taken");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&b.into_inner().unwrap()).unwrap();
+    (gz.finish().unwrap(), wanted)
+}
+fn pack_pin(name: &str, source: &[u8], files: &[(String, Vec<u8>)]) -> lu_core::engines::RuntimePack {
+    use lu_core::engines::{PackFile, PackSource, RuntimePack};
+    RuntimePack {
+        name: name.into(),
+        for_variant: Variant::Rocm,
+        platform: platform().into(),
+        gfx: vec!["gfx1201".into()],
+        gpu_names: vec!["Radeon AI PRO R9700".into()],
+        source: PackSource { url: format!("https://stable.repo.amd.com/rocm/core/tarball/{name}.tar.gz"), bytes: source.len() as u64, sha256: format!("{:x}", Sha256::digest(source)) },
+        files: files.iter().map(|(p, d)| PackFile { path: p.clone(), bytes: d.len() as u64, sha256: format!("{:x}", Sha256::digest(d)) }).collect(),
+    }
+}
+
+#[test]
+fn a_runtime_pack_makes_a_rocm_build_see_the_gpu() {
+    let lu = lu("pack");
+    let turn = say(&lu, 1, "Set up ROCm");
+    let (ext, rocm_bytes) = release(&["NEEDS_HIPBLAS"], None);
+    let rocm = pin("b100", Variant::Rocm, &ext, &rocm_bytes);
+    let (src_tar, files) = pack_source();
+    let pack = pack_pin("rocm-test-gfx120X", &src_tar, &files);
+    let mut bad_files = files.clone();
+    bad_files[1].1 = b"MZ rocblas tampered".to_vec();
+    let tampered = pack_pin("rocm-tampered", &src_tar, &bad_files);
+    let mut assets = HashMap::new();
+    assets.insert(format!("/{}/{}", rocm.version, rocm.asset), rocm_bytes.clone());
+    assets.insert("/packs/rocm-test-gfx120X.tar.gz".to_owned(), src_tar.clone());
+    assets.insert("/packs/rocm-tampered.tar.gz".to_owned(), src_tar.clone());
+    let src = EngineSource::local_test(&source(assets)).unwrap();
+    let rec = Recorder::new(&lu.book, &lu.journal, "c-1");
+    let store = EngineStore::open(&lu.dir.join("engines"), vec![rocm.clone()], &src, &rec, &lu.gate, &lu.governor).unwrap();
+
+    // Without the pack, like the real build on the owner's PC: no GPU.
+    match store.install("e-1", &turn, &rocm, true, &AtomicBool::new(false), &mut no_progress()) {
+        Err(EngineError::SmokeFailed(why)) => assert!(why.contains("finds no usable GPU"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // A pack whose files do not match their pins is refused whole.
+    assert!(matches!(store.install_pack("p-0", &turn, &tampered, None, &AtomicBool::new(false), &mut no_progress()), Err(EngineError::HashMismatch { .. })));
+    assert!(store.installed_packs().unwrap().is_empty());
+    assert!(!lu.dir.join("engines/runtime/rocm-tampered").exists());
+    // The real pack: only the pinned files, licences included.
+    let dir = store.install_pack("p-1", &turn, &pack, None, &AtomicBool::new(false), &mut no_progress()).unwrap();
+    assert!(dir.join("bin/hipblas.dll").is_file() && dir.join("bin/rocblas/library/Kernels.so-000-gfx1201.hsaco").is_file());
+    assert!(dir.join("share/doc/rocblas/LICENSE.md").is_file());
+    assert!(!dir.join("bin/MIOpen.dll").exists() && !dir.join("bin/clinfo.exe").exists());
+    assert!(lu.gate.external_file(&dir.join("bin/rocblas.dll")).unwrap().is_some());
+    assert_eq!(store.runtime_dirs(Variant::Rocm).unwrap(), [dir.join("bin")]);
+    assert!(store.runtime_dirs(Variant::Vulkan).unwrap().is_empty());
+    assert_eq!(fs::read_dir(lu.dir.join("engines/.staging")).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains("rocm-test")).count(), 0, "source and unpack folder removed");
+
+    // With the pack, the same build sees the GPU and loads on it.
+    let b = store.install("e-2", &turn, &rocm, true, &AtomicBool::new(false), &mut no_progress()).unwrap();
+    assert!(b.report.contains("TEST0"), "{}", b.report);
+    let model = model_file(&lu.dir);
+    let m = model.to_string_lossy().into_owned();
+    let (server, failed) = load_with_fallback(&store, &m, true, &RunSettings { load_timeout: Duration::from_secs(30), ..RunSettings::default() }, &lu.dir.join("logs")).unwrap();
+    assert_eq!(server.build.variant, Variant::Rocm);
+    assert!(failed.is_empty(), "{failed:?}");
+    assert!(server.device_report().iter().any(|l| l.contains("offloaded 33/33")));
+}
+
+#[test]
+fn a_local_copy_of_the_pack_source_is_used_instead_of_downloading() {
+    let lu = lu("pack-local");
+    let turn = say(&lu, 1, "Set up ROCm from the installer");
+    let (src_tar, files) = pack_source();
+    let pack = pack_pin("rocm-local-gfx120X", &src_tar, &files);
+    // The source is not served at all: only the local copy can work.
+    let src = EngineSource::local_test(&source(HashMap::new())).unwrap();
+    let rec = Recorder::new(&lu.book, &lu.journal, "c-1");
+    let store = EngineStore::open(&lu.dir.join("engines"), vec![], &src, &rec, &lu.gate, &lu.governor).unwrap();
+    let copy = lu.dir.join("from-installer.tar.gz");
+    fs::write(&copy, &src_tar).unwrap();
+    let dir = store.install_pack("p-1", &turn, &pack, Some(&copy), &AtomicBool::new(false), &mut no_progress()).unwrap();
+    assert!(dir.join("bin/hipblas.dll").is_file());
+    assert!(copy.exists(), "the user's copy is left alone");
+    // A wrong local copy (wrong size) is ignored, never trusted.
+    let pack2 = pack_pin("rocm-local2-gfx120X", &src_tar, &files);
+    fs::write(&copy, b"something else").unwrap();
+    assert!(store.install_pack("p-2", &turn, &pack2, Some(&copy), &AtomicBool::new(false), &mut no_progress()).is_err());
+}
+
+#[test]
+fn the_shipped_rocm_pack_list_is_valid() {
+    let packs = lu_core::engines::parse_packs(lu_core::engines::PACKS_JSON).unwrap();
+    assert_eq!(packs.len(), 1);
+    let p = &packs[0];
+    assert_eq!((p.name.as_str(), p.for_variant, p.platform.as_str()), ("rocm-10.0.0-gfx120X", Variant::Rocm, "windows-x64"));
+    assert!(p.source.url.starts_with("https://stable.repo.amd.com/"));
+    assert_eq!(p.source.sha256, "75da73c483cbc0456d9008f2079b333f4f9d3b7744705378ff8007e502ca38c5");
+    for dll in ["bin/hipblas.dll", "bin/rocblas.dll", "bin/rocsolver.dll", "bin/libhipblaslt.dll", "bin/origami.dll"] {
+        assert!(p.files.iter().any(|f| f.path == dll), "{dll}");
+    }
+    assert_eq!(p.files.iter().filter(|f| f.path.contains("LICENSE")).count(), 7);
+    assert!(p.serves("AMD Radeon AI PRO R9700") && p.serves("AMD Radeon RX 9070 XT") && !p.serves("AMD Radeon RX 7900 XTX"));
 }

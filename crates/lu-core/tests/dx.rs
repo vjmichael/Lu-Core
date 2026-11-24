@@ -250,11 +250,11 @@ fn test_build(dir: &Path, variant: Variant) -> EngineBuild {
 fn device_and_load_checks_run_only_when_asked_and_report_where_the_model_went() {
     let dir = base("active");
     let build = test_build(&dir, Variant::Vulkan);
-    let f = dx::device_check(&build);
+    let f = dx::device_check(&build, &[]);
     assert_eq!(f.severity, Severity::Ok);
     assert_eq!(f.evidence, ["TEST0: Lu Test GPU (8192 MiB, 8000 MiB free)"]);
     fs::write(build.dir.join("NO_DEVICES"), "1").unwrap();
-    assert_eq!(dx::device_check(&build).severity, Severity::Problem);
+    assert_eq!(dx::device_check(&build, &[]).severity, Severity::Problem);
     fs::remove_file(build.dir.join("NO_DEVICES")).unwrap();
 
     let model = dir.join("tiny-Q4_K_M.gguf");
