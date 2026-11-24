@@ -105,6 +105,14 @@ fn main() {
             reply(&mut s, "401 Unauthorized", r#"{"error":{"message":"Invalid API Key"}}"#);
             continue;
         }
+        if path == "/v1/chat/completions" {
+            if crash_after_load {
+                eprintln!("GGML_ASSERT failed: simulated crash");
+                std::process::exit(134);
+            }
+            chat(&mut s, &body);
+            continue;
+        }
         if path == "/completion" {
             if crash_after_load {
                 eprintln!("GGML_ASSERT failed: simulated crash");
@@ -116,4 +124,56 @@ fn main() {
             reply(&mut s, "404 Not Found", r#"{"error":{"message":"not found"}}"#);
         }
     }
+}
+
+
+/// Scripted chat, streamed as server-sent events like llama-server:
+/// - the last message is a tool result: reply "Tool said: <first 60 chars>";
+/// - the last user message contains `TOOL:<name>:<json>`: call that tool;
+/// - it contains `LOOP`: repeat one sentence until Lu stops it;
+/// - otherwise: "Hello! You said: <text>", streamed in small pieces.
+fn chat(s: &mut std::net::TcpStream, body: &[u8]) {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let messages = v["messages"].as_array().cloned().unwrap_or_default();
+    let last = messages.last().cloned().unwrap_or_default();
+    let system = messages.first().and_then(|m| m["content"].as_str()).unwrap_or("").to_owned();
+    let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+    let send = |s: &mut std::net::TcpStream, chunk: serde_json::Value| {
+        let _ = write!(s, "data: {chunk}\n\n");
+        let _ = s.flush();
+    };
+    let text_chunk = |t: &str| serde_json::json!({"choices":[{"index":0,"delta":{"content":t},"finish_reason":null}]});
+    let finish = |reason: &str| serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"timings":{"prompt_per_second":310.0,"predicted_per_second":42.5}});
+    let content = last["content"].as_str().unwrap_or("").to_owned();
+    if last["role"] == "tool" {
+        let short: String = content.chars().take(60).collect();
+        for piece in ["Tool ", "said: ", &short] {
+            send(s, text_chunk(piece));
+        }
+        send(s, finish("stop"));
+    } else if let Some(rest) = content.split("TOOL:").nth(1) {
+        let (name, args) = rest.split_once(':').unwrap_or((rest, "{}"));
+        let call = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":name.trim(),"arguments":""}}]},"finish_reason":null}]});
+        send(s, call);
+        // Arguments arrive in pieces, as from a real engine.
+        let args = args.trim();
+        let mid = args.len() / 2;
+        for part in [&args[..mid], &args[mid..]] {
+            send(s, serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":part}}]},"finish_reason":null}]}));
+        }
+        send(s, finish("tool_calls"));
+    } else if content.contains("LOOP") {
+        for _ in 0..400 {
+            send(s, text_chunk("I will keep saying this same sentence. "));
+        }
+        send(s, finish("length"));
+    } else {
+        let memory = if system.contains("[Lu memory") { " (memory received)" } else { "" };
+        let reply = format!("Hello! You said: {content}{memory}");
+        for piece in reply.as_bytes().chunks(7) {
+            send(s, text_chunk(&String::from_utf8_lossy(piece)));
+        }
+        send(s, finish("stop"));
+    }
+    let _ = write!(s, "data: [DONE]\n\n");
 }

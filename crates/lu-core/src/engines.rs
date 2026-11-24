@@ -1109,6 +1109,66 @@ impl Default for RunSettings {
     }
 }
 
+/// One message of a chat, as the engine's chat API takes it (JSON only at
+/// this boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    /// `system`, `user`, `assistant` or `tool`.
+    pub role: String,
+    pub content: String,
+    /// Tool calls the assistant made (assistant messages only).
+    pub tool_calls: Vec<ToolCall>,
+    /// The call this message answers (tool messages only).
+    pub tool_call_id: Option<String>,
+}
+impl ChatMessage {
+    pub fn new(role: &str, content: impl Into<String>) -> Self {
+        Self { role: role.into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: None }
+    }
+    fn to_json(&self) -> serde_json::Value {
+        let mut m = serde_json::json!({ "role": self.role, "content": self.content });
+        if !self.tool_calls.is_empty() {
+            m["tool_calls"] = serde_json::Value::Array(
+                self.tool_calls
+                    .iter()
+                    .map(|c| serde_json::json!({ "id": c.id, "type": "function", "function": { "name": c.name, "arguments": c.arguments } }))
+                    .collect(),
+            );
+        }
+        if let Some(id) = &self.tool_call_id {
+            m["tool_call_id"] = serde_json::Value::String(id.clone());
+        }
+        m
+    }
+}
+
+/// A tool call the model made: the function name and its arguments as the
+/// model wrote them (JSON text, parsed and checked by the caller).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// A tool the model may call, with its parameters as JSON Schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatReply {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    /// `stop`, `tool_calls`, `length`, or `loop` when Lu stopped a repeating stream.
+    pub finish_reason: String,
+    pub prompt_tokens_per_second: Option<f64>,
+    pub tokens_per_second: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Completion {
     pub text: String,
@@ -1216,7 +1276,7 @@ impl LlamaServer {
         let mut cmd = Command::new(&self.build.server);
         cmd.arg("--model").arg(model);
         cmd.args(["--host", "127.0.0.1", "--port", &port.to_string(), "--api-key", &key]);
-        cmd.args(["--ctx-size", &self.settings.context.to_string(), "--n-gpu-layers", &layers.to_string(), "--parallel", "1", "--no-webui"]);
+        cmd.args(["--ctx-size", &self.settings.context.to_string(), "--n-gpu-layers", &layers.to_string(), "--parallel", "1", "--no-webui", "--jinja"]);
         if let Some(t) = self.settings.threads {
             cmd.args(["--threads", &t.to_string()]);
         }
@@ -1277,6 +1337,119 @@ impl LlamaServer {
             r.tree.kill();
             let _ = r.child.wait();
         }
+    }
+
+    /// A chat turn through the engine's chat API, streamed: each piece of
+    /// text goes to `on_text` as it arrives. Tool calls are collected and
+    /// returned, not run. The stream loop guard stops a reply that repeats
+    /// itself; the partial reply is returned with finish reason `loop`.
+    pub fn chat(&mut self, messages: &[ChatMessage], tools: &[ToolSpec], max_tokens: u32, on_text: &mut dyn FnMut(&str)) -> Result<ChatReply, EngineError> {
+        let r = self.running.as_ref().ok_or_else(|| EngineError::Invalid("no model loaded".into()))?;
+        let url = format!("http://127.0.0.1:{}/v1/chat/completions", r.port);
+        let key = r.key.clone();
+        let log = r.log.clone();
+        let mut body = serde_json::json!({
+            "messages": messages.iter().map(ChatMessage::to_json).collect::<Vec<_>>(),
+            "stream": true,
+            "max_tokens": max_tokens,
+            "cache_prompt": true,
+            "timings_per_token": false,
+        });
+        if !tools.is_empty() {
+            let mut list = Vec::new();
+            for t in tools {
+                let params: serde_json::Value = serde_json::from_str(&t.parameters).map_err(|e| EngineError::Invalid(format!("tool {}: {e}", t.name)))?;
+                list.push(serde_json::json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": params } }));
+            }
+            body["tools"] = serde_json::Value::Array(list);
+        }
+        let sent = self.agent.post(&url).header("Authorization", &format!("Bearer {key}")).header("Content-Type", "application/json").send(body.to_string().as_bytes());
+        let resp = match sent {
+            Ok(r) => r,
+            Err(e) => {
+                let until = Instant::now() + Duration::from_secs(2);
+                while self.alive() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if !self.alive() {
+                    self.stop();
+                    return Err(EngineError::Crashed(format!("{e}; {}", tail(&log, 3))));
+                }
+                return Err(EngineError::Network(e.to_string()));
+            }
+        };
+        let status = resp.status().as_u16();
+        if status != 200 {
+            let text = resp.into_body().with_config().limit(1 << 20).read_to_string().unwrap_or_default();
+            return Err(EngineError::Invalid(format!("the engine answered {status}: {}", &text[..text.len().min(300)])));
+        }
+        let mut reader = std::io::BufReader::new(resp.into_body().into_reader());
+        let mut reply = ChatReply { content: String::new(), tool_calls: Vec::new(), finish_reason: "stop".into(), prompt_tokens_per_second: None, tokens_per_second: None };
+        let mut calls: BTreeMap<u64, ToolCall> = BTreeMap::new();
+        let mut guard = crate::loop_guard::StreamLoopGuard::default();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(n) => n,
+                Err(e) => {
+                    if !self.alive() {
+                        self.stop();
+                        return Err(EngineError::Crashed(format!("{e}; {}", tail(&log, 3))));
+                    }
+                    return Err(EngineError::Network(e.to_string()));
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            let Some(data) = line.trim_end().strip_prefix("data: ") else { continue };
+            if data == "[DONE]" {
+                break;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { continue };
+            if let Some(t) = v.get("timings") {
+                reply.prompt_tokens_per_second = t.get("prompt_per_second").and_then(|x| x.as_f64());
+                reply.tokens_per_second = t.get("predicted_per_second").and_then(|x| x.as_f64());
+            }
+            let Some(choice) = v.pointer("/choices/0") else { continue };
+            if let Some(f) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+                reply.finish_reason = f.to_owned();
+            }
+            let Some(delta) = choice.get("delta") else { continue };
+            if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    if guard.observe_chunk(text) != crate::loop_guard::StreamLoopVerdict::Continue {
+                        reply.finish_reason = "loop".into();
+                        break;
+                    }
+                    reply.content.push_str(text);
+                    on_text(text);
+                }
+            }
+            if let Some(list) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                for c in list {
+                    let index = c.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    let entry = calls.entry(index).or_insert_with(|| ToolCall { id: String::new(), name: String::new(), arguments: String::new() });
+                    if let Some(id) = c.get("id").and_then(|i| i.as_str()) {
+                        entry.id = id.to_owned();
+                    }
+                    if let Some(name) = c.pointer("/function/name").and_then(|i| i.as_str()) {
+                        entry.name.push_str(name);
+                    }
+                    if let Some(args) = c.pointer("/function/arguments").and_then(|i| i.as_str()) {
+                        entry.arguments.push_str(args);
+                    }
+                }
+            }
+        }
+        reply.tool_calls = calls.into_values().enumerate().map(|(i, mut c)| {
+            if c.id.is_empty() {
+                c.id = format!("call_{i}");
+            }
+            c
+        }).collect();
+        Ok(reply)
     }
 
     /// A plain completion (used for the speed record and smoke checks; chat
