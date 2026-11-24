@@ -119,8 +119,12 @@ impl CancelToken {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
-    fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+    /// The flag itself, for code that checks it directly.
+    pub fn flag(&self) -> &AtomicBool {
+        &self.0
     }
 }
 

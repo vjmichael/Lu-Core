@@ -3,6 +3,26 @@
 .transfers { display: flex; flex-direction: column; gap: 6px; padding: 10px 16px; border-bottom: 1px solid var(--line, #e5e7eb); background: var(--panel, transparent); }
 .transfers .row { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; font-size: 13px; }
 .transfers .row .strip-bar { grid-column: 1 / -1; height: 6px; }
+.composer .box { flex-direction: column; align-items: stretch; }
+.composer .box .row { display: flex; align-items: flex-end; gap: 8px; width: 100%; }
+.composer .box .row textarea { flex: 1; }
+.attach { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 2px 8px; }
+.attachments { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-top: 6px; }
+.file-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 280px; padding: 4px 10px; border: 1px solid var(--seam); border-radius: 10px; background: var(--panel-2); font-size: 12.5px; }
+.file-chip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-chip .x { border: 0; background: none; cursor: pointer; color: var(--muted); padding: 0 2px; font-size: 14px; }
+.msg-tools { display: flex; gap: 4px; margin-top: 4px; opacity: 0; transition: opacity .15s; }
+.msg:hover .msg-tools, .msg-tools:focus-within { opacity: 1; }
+.msg.user { flex-direction: column; align-items: flex-end; }
+.msg-tools button { border: 0; background: none; color: var(--muted); font-size: 12px; padding: 2px 6px; border-radius: 6px; cursor: pointer; }
+.msg-tools button:hover { background: var(--panel-3); }
+.approval { border: 1px solid var(--seam); border-radius: 14px; padding: 12px 14px; margin: 4px 0 12px; background: var(--panel-2); }
+.approval .q { margin-bottom: 4px; }
+.approval .f { font: 12.5px var(--mono); color: var(--muted); word-break: break-all; margin-bottom: 10px; }
+.approval .btns { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.approval .t { margin-left: auto; font-size: 12px; color: var(--muted); }
+.reasoning { font-size: 12.5px; white-space: nowrap; }
+.note-line { font-size: 12.5px; color: var(--muted); margin: 0 0 8px; }
 /* Lu — a clean station interior: white panels, fine seams, soft light strips,
    one warm amber light. Night mode dims the station; it does not change it. */
 

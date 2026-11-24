@@ -37,8 +37,12 @@
       <div class="thread scroll" id="thread"><div class="inner" id="messages"></div></div>
       <div class="composer">
         <div class="panel box">
-          <textarea id="input" rows="1" placeholder="Message Lu"></textarea>
-          <button class="btn primary" id="send">Send</button>
+          <div class="attach hidden" id="attach"></div>
+          <div class="row">
+            <textarea id="input" rows="1" placeholder="Message Lu"></textarea>
+            <button class="btn ghost reasoning hidden" id="reasoning" title="How hard the model thinks"></button>
+            <button class="btn primary" id="send">Send</button>
+          </div>
         </div>
         <div class="hint" id="hint">Enter to send · Shift+Enter for a new line</div>
       </div>

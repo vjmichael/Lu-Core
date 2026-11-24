@@ -175,10 +175,15 @@ struct GitScope {
 }
 
 fn git(scope: &Path, args: &[&str]) -> Result<Vec<u8>, SnapshotError> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(scope)
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(scope).args(args);
+    // Lu is a windowed app: without this, every call flashes a console window.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd
         .output()
         .map_err(|e| SnapshotError::Git(e.to_string()))?;
     if !out.status.success() {

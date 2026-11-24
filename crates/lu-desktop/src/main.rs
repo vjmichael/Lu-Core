@@ -29,9 +29,9 @@ use catalog::{find_gguf, Catalog, ModelEntry, ModelSettings};
 use lu_core::{
     ansf::AnsfStore,
     ansf_live_chat::{LiveEvent, LiveKind},
-    chat::{folders_named, new_id, ChatConfig, ChatEvent, ChatLoop, DEFAULT_SYSTEM_PROMPT},
+    chat::{folders_named, image_data_url, is_image, new_id, ChatConfig, ChatEvent, ChatLoop, DEFAULT_SYSTEM_PROMPT},
     conversations::{ConversationLibrary, SearchHit},
-    engines::{load_with_fallback, shipped_packs, shipped_pins, EngineSource, EngineStore, LlamaServer, RunSettings, Variant},
+    engines::{load_with_fallback, reasoning_levels, shipped_packs, shipped_pins, EngineSource, EngineStore, LlamaServer, RunSettings, Variant},
     environment::EnvironmentStore,
     files::{FileAccess, WorkingScope},
     gguf,
@@ -40,7 +40,7 @@ use lu_core::{
     origin::OriginGate,
     recorder::Recorder,
     resources::{measure, Governor},
-    runner::CommandRunner,
+    runner::{CancelToken, CommandRunner},
     snapshot::{SnapshotLimits, SnapshotStore},
 };
 use serde::Serialize;
@@ -124,12 +124,14 @@ struct ModelStatus {
     progress: f64,
     message: Option<String>,
     busy: bool,
+    /// Reasoning settings the loaded model takes (empty: none).
+    reasoning: Vec<String>,
 }
 
 enum Job {
     Load(i64),
     Unload,
-    Send { chat: String, text: String },
+    Send { chat: String, text: String, attachments: Vec<String>, reasoning: Option<String> },
 }
 
 /// Downloads and engine installs in progress, so any window or tab that
@@ -152,6 +154,14 @@ fn transfer(key: &str, v: Option<Value>) {
 /// reopened mid-answer shows it. Also which conversations are waiting.
 static LIVE: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 static WAITING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The conversation being answered now, and how to stop it.
+static CURRENT: Mutex<Option<(String, CancelToken)>> = Mutex::new(None);
+/// Waiting messages the user stopped before they started.
+static SKIP: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Approvals Lu is waiting for: id -> the user's answer.
+static APPROVALS: Mutex<BTreeMap<String, mpsc::Sender<String>>> = Mutex::new(BTreeMap::new());
+/// How long Lu waits for an approval before ending the turn.
+const APPROVAL_SECONDS: u64 = 120;
 
 struct App {
     base: &'static Base,
@@ -245,7 +255,8 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                             Variant::Cpu => "CPU",
                         }
                         .to_owned();
-                        set_status(&app, &status, |s| *s = ModelStatus { state: "loaded".into(), model_id: Some(id), model: Some(model.name.clone()), backend: Some(backend), progress: 1.0, ..Default::default() });
+                        let reasoning = reasoning_levels(&server.chat_template().unwrap_or_default()).into_iter().map(str::to_owned).collect();
+                        set_status(&app, &status, |s| *s = ModelStatus { state: "loaded".into(), model_id: Some(id), model: Some(model.name.clone()), backend: Some(backend), progress: 1.0, reasoning, ..Default::default() });
                         engine = Some((server, model));
                     }
                     Err(e) => {
@@ -254,11 +265,16 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                     }
                 }
             }
-            Job::Send { chat, text } => {
+            Job::Send { chat, text, attachments, reasoning } => {
                 if let Ok(mut w) = WAITING.lock() {
                     if let Some(i) = w.iter().position(|c| *c == chat) {
                         w.remove(i);
                     }
+                }
+                let skipped = SKIP.lock().map(|mut s| s.iter().position(|c| *c == chat).map(|i| s.remove(i)).is_some()).unwrap_or(false);
+                if skipped {
+                    let _ = app.emit("chat-event", json!({"chat": chat, "type": "finished", "stopped": "you stopped it before it started"}));
+                    continue;
                 }
                 let _ = app.emit("chat-event", json!({"chat": chat, "type": "started"}));
                 let Some((server, model)) = engine.as_mut() else {
@@ -266,7 +282,14 @@ fn model_thread(app: AppHandle, base: &'static Base, status: Arc<Mutex<ModelStat
                     continue;
                 };
                 set_status(&app, &status, |s| s.busy = true);
-                let result = run_turn(&app, base, server, model, &chat, &text);
+                let cancel = CancelToken::default();
+                if let Ok(mut c) = CURRENT.lock() {
+                    *c = Some((chat.clone(), cancel.clone()));
+                }
+                let result = run_turn(&app, base, server, model, &chat, &text, &attachments, reasoning.as_deref(), cancel);
+                if let Ok(mut c) = CURRENT.lock() {
+                    *c = None;
+                }
                 if let Err(e) = result {
                     let _ = app.emit("chat-event", json!({"chat": chat, "type": "error", "text": e}));
                 }
@@ -286,8 +309,51 @@ fn plain_load_error(e: &str) -> String {
     }
 }
 
-fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, model: &ModelEntry, chat: &str, text: &str) -> Result<(), String> {
-    base.library.note_message(chat, "user", text).map_err(|e| e.to_string())?;
+/// A reasoning setting the UI sent, as the engine names it.
+fn reasoning_static(r: Option<&str>) -> Option<&'static str> {
+    match r? {
+        "off" => Some("off"),
+        "on" => Some("on"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, model: &ModelEntry, chat: &str, typed: &str, attachments: &[String], reasoning: Option<&str>, cancel: CancelToken) -> Result<(), String> {
+    // Attached files stay where they are: the message names them (which also
+    // lets Lu work in their folders for this message), and images are shown
+    // to the model when it can see.
+    let mut images = Vec::new();
+    let mut text = typed.to_owned();
+    let mut notes = Vec::new();
+    for a in attachments {
+        let p = PathBuf::from(a);
+        if is_image(&p) {
+            if model.projector.is_some() {
+                match image_data_url(&p) {
+                    Ok(u) => images.push(u),
+                    Err(e) => notes.push(format!("{a}: not shown ({e})")),
+                }
+            } else {
+                notes.push(format!("{a}: this model cannot see images, so it was not shown"));
+            }
+        }
+    }
+    if !attachments.is_empty() {
+        text.push('\n');
+        for a in attachments {
+            text.push_str(&format!("\n[Attached] {a}"));
+        }
+    }
+    base.library.note_message(chat, "user", &text).map_err(|e| e.to_string())?;
+    for n in notes {
+        let _ = app.emit("chat-event", json!({"chat": chat, "type": "note", "text": n}));
+    }
+    let text = if images.is_empty() { text } else { format!("{text}\n(The attached image{} shown to you with this message.)", if images.len() > 1 { "s are" } else { " is" }) };
+    let text = text.as_str();
     let _ = app.emit("library-changed", ());
     let book = base.library.book(chat).map_err(|e| e.to_string())?;
     let rec = Recorder::new(&book, &base.journal, chat);
@@ -296,7 +362,7 @@ fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, mode
     // Where Lu may work: the workspace, folders the user allowed before, and
     // folders the user names in this very message (their words are the OK).
     let mut roots = vec![workspace.clone()];
-    for p in base.catalog.allowed_folders().into_iter().chain(folders_named(text)) {
+    for p in base.catalog.allowed_folders().into_iter().chain(folders_named(text)).chain(attachments.iter().filter_map(|a| Path::new(a).parent().map(Path::to_path_buf))) {
         let p = std::fs::canonicalize(&p).map(|c| PathBuf::from(c.to_string_lossy().trim_start_matches(r"\\?\").to_owned())).unwrap_or(p);
         if !roots.contains(&p) {
             roots.push(p);
@@ -308,7 +374,43 @@ fn run_turn(app: &AppHandle, base: &'static Base, server: &mut LlamaServer, mode
     config.system_prompt = model.settings.system_prompt.clone().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_owned());
     config.temperature = model.settings.temperature;
     config.top_p = model.settings.top_p;
-    let lp = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: Some(&base.environment), profile: None, config };
+    config.reasoning = reasoning_static(reasoning);
+    config.images = images;
+    // Pause and ask: the user has APPROVAL_SECONDS to answer, or the turn ends.
+    let approve_chat = chat.to_owned();
+    let approve_cancel = cancel.clone();
+    let approve = move |what: &str, folder: &str| -> bool {
+        let id = new_id('h');
+        let (tx, rx) = mpsc::channel();
+        if let Ok(mut a) = APPROVALS.lock() {
+            a.insert(id.clone(), tx);
+        }
+        let _ = app.emit("chat-event", json!({"chat": approve_chat, "type": "approval", "id": id, "what": what, "folder": folder, "seconds": APPROVAL_SECONDS}));
+        let deadline = Instant::now() + Duration::from_secs(APPROVAL_SECONDS);
+        let answer = loop {
+            if approve_cancel.is_cancelled() {
+                break "stopped".to_owned();
+            }
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(a) => break a,
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(_) => break "timeout".to_owned(),
+            }
+        };
+        if let Ok(mut a) = APPROVALS.lock() {
+            a.remove(&id);
+        }
+        let ok = answer == "once" || answer == "always";
+        if answer == "always" {
+            let _ = base.instruction(&format!("Allow Lu to work in {folder}"));
+            let _ = base.catalog.allow_folder(Path::new(folder));
+        } else if ok {
+            let _ = base.instruction(&format!("Allow Lu to work in {folder} for this answer"));
+        }
+        let _ = app.emit("chat-event", json!({"chat": approve_chat, "type": "approval-done", "id": id, "answer": answer}));
+        ok
+    };
+    let lp = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: Some(&base.environment), profile: None, config, cancel, approve: Some(&approve) };
     let chat_id = chat.to_owned();
     if let Ok(mut l) = LIVE.lock() {
         l.insert(chat_id.clone(), String::new());
@@ -409,8 +511,9 @@ fn erase_chat(app: State<App>, trash_id: String) -> R<()> {
     app.base.library.empty_trash_item(&trash_id).map_err(s)
 }
 #[tauri::command]
-fn send_message(handle: AppHandle, app: State<App>, chat: String, text: String) -> R<()> {
-    if text.trim().is_empty() {
+fn send_message(handle: AppHandle, app: State<App>, chat: String, text: String, attachments: Option<Vec<String>>, reasoning: Option<String>) -> R<()> {
+    let attachments = attachments.unwrap_or_default();
+    if text.trim().is_empty() && attachments.is_empty() {
         return Err("nothing to send".into());
     }
     let busy = app.status.lock().map_err(s)?.busy || !WAITING.lock().map_err(s)?.is_empty();
@@ -418,7 +521,32 @@ fn send_message(handle: AppHandle, app: State<App>, chat: String, text: String) 
     if busy {
         let _ = handle.emit("chat-event", json!({"chat": chat, "type": "queued"}));
     }
-    app.jobs.lock().map_err(s)?.send(Job::Send { chat, text }).map_err(s)
+    app.jobs.lock().map_err(s)?.send(Job::Send { chat, text, attachments, reasoning }).map_err(s)
+}
+
+/// Stop the answer being written in a conversation (or its waiting message).
+#[tauri::command]
+fn stop_chat(chat: String) -> R<()> {
+    if let Some((c, token)) = CURRENT.lock().map_err(s)?.as_ref() {
+        if *c == chat {
+            token.cancel();
+            return Ok(());
+        }
+    }
+    if WAITING.lock().map_err(s)?.contains(&chat) {
+        SKIP.lock().map_err(s)?.push(chat);
+    }
+    Ok(())
+}
+
+/// The user's answer to an approval: `once`, `always` or `deny`.
+#[tauri::command]
+fn answer_approval(id: String, choice: String) -> R<()> {
+    if !matches!(choice.as_str(), "once" | "always" | "deny") {
+        return Err("unknown answer".into());
+    }
+    let tx = APPROVALS.lock().map_err(s)?.get(&id).cloned().ok_or("This question is no longer waiting.")?;
+    tx.send(choice).map_err(s)
 }
 
 /// What a conversation is doing now: its answer so far, or that it waits.
@@ -784,7 +912,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            library, new_chat, rename_chat, delete_chat, new_folder, rename_folder, delete_folder, move_chat, search_chats, chat_messages, trash, restore_chat, erase_chat, send_message, chat_live,
+            library, new_chat, rename_chat, delete_chat, new_folder, rename_folder, delete_folder, move_chat, search_chats, chat_messages, trash, restore_chat, erase_chat, send_message, chat_live, stop_chat, answer_approval,
             model_status, load_model, unload_model, models, save_model_settings, rename_model, remove_model, delete_model, import_model, scan_models,
             hf_search, hf_files, hf_download, engines, install_engine, rollback_engine, app_settings, set_workspace, open_window, transfers, download_history, clear_download_history, allow_folder, forget_folder
         ])

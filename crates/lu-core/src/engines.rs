@@ -1109,6 +1109,23 @@ impl Default for RunSettings {
     }
 }
 
+/// The reasoning settings a chat template takes, in the order to show
+/// them: `low`/`medium`/`high` when it reads `reasoning_effort`, `off`/`on`
+/// when it reads `enable_thinking`, nothing otherwise.
+pub fn reasoning_levels(template: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if template.contains("reasoning_effort") {
+        out.extend(["low", "medium", "high"]);
+    }
+    if template.contains("enable_thinking") {
+        out.insert(0, "off");
+        if out.len() == 1 {
+            out.push("on");
+        }
+    }
+    out
+}
+
 /// One message of a chat, as the engine's chat API takes it (JSON only at
 /// this boundary).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1120,13 +1137,21 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     /// The call this message answers (tool messages only).
     pub tool_call_id: Option<String>,
+    /// Images shown to the model with this message, as `data:` URLs
+    /// (needs a model loaded with its image support file).
+    pub images: Vec<String>,
 }
 impl ChatMessage {
     pub fn new(role: &str, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: None }
+        Self { role: role.into(), content: content.into(), tool_calls: Vec::new(), tool_call_id: None, images: Vec::new() }
     }
     fn to_json(&self) -> serde_json::Value {
         let mut m = serde_json::json!({ "role": self.role, "content": self.content });
+        if !self.images.is_empty() {
+            let mut parts = vec![serde_json::json!({ "type": "text", "text": self.content })];
+            parts.extend(self.images.iter().map(|u| serde_json::json!({ "type": "image_url", "image_url": { "url": u } })));
+            m["content"] = serde_json::Value::Array(parts);
+        }
         if !self.tool_calls.is_empty() {
             m["tool_calls"] = serde_json::Value::Array(
                 self.tool_calls
@@ -1166,10 +1191,13 @@ pub struct ChatOptions {
     /// `None` uses the model's own default.
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    /// How hard the model thinks, for models whose chat template takes it:
+    /// `off`, `on`, `low`, `medium`, `high` (see [`reasoning_levels`]).
+    pub reasoning: Option<&'static str>,
 }
 impl Default for ChatOptions {
     fn default() -> Self {
-        Self { max_tokens: 4096, temperature: None, top_p: None }
+        Self { max_tokens: 4096, temperature: None, top_p: None, reasoning: None }
     }
 }
 
@@ -1363,6 +1391,24 @@ impl LlamaServer {
     /// returned, not run. The stream loop guard stops a reply that repeats
     /// itself; the partial reply is returned with finish reason `loop`.
     pub fn chat(&mut self, messages: &[ChatMessage], tools: &[ToolSpec], options: &ChatOptions, on_text: &mut dyn FnMut(&str)) -> Result<ChatReply, EngineError> {
+        self.chat_with_stop(messages, tools, options, None, on_text)
+    }
+
+    /// The model's chat template (from the running server), to see which
+    /// reasoning settings it takes.
+    pub fn chat_template(&self) -> Option<String> {
+        let r = self.running.as_ref()?;
+        let url = format!("http://127.0.0.1:{}/props", r.port);
+        let resp = self.agent.get(&url).header("Authorization", &format!("Bearer {}", r.key)).call().ok()?;
+        let text = resp.into_body().with_config().limit(8 << 20).read_to_string().ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        v.get("chat_template").and_then(|t| t.as_str()).map(str::to_owned)
+    }
+
+    /// [`chat`](Self::chat) that ends early (finish reason `stopped`) when
+    /// `stop` is set; closing the stream ends the generation in the engine.
+    pub fn chat_with_stop(&mut self, messages: &[ChatMessage], tools: &[ToolSpec], options: &ChatOptions, stop: Option<&AtomicBool>, on_text: &mut dyn FnMut(&str)) -> Result<ChatReply, EngineError> {
+        let stopped = || stop.is_some_and(|s| s.load(Ordering::SeqCst));
         let r = self.running.as_ref().ok_or_else(|| EngineError::Invalid("no model loaded".into()))?;
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", r.port);
         let key = r.key.clone();
@@ -1379,6 +1425,14 @@ impl LlamaServer {
         }
         if let Some(p) = options.top_p {
             body["top_p"] = serde_json::json!(p);
+        }
+        if let Some(level) = options.reasoning {
+            // Templates read the keys they know and ignore the others.
+            let mut kw = serde_json::json!({ "enable_thinking": level != "off" });
+            if !matches!(level, "on" | "off") {
+                kw["reasoning_effort"] = serde_json::json!(level);
+            }
+            body["chat_template_kwargs"] = kw;
         }
         if !tools.is_empty() {
             let mut list = Vec::new();
@@ -1414,6 +1468,10 @@ impl LlamaServer {
         let mut guard = crate::loop_guard::StreamLoopGuard::default();
         let mut line = String::new();
         loop {
+            if stopped() {
+                reply.finish_reason = "stopped".into();
+                break;
+            }
             line.clear();
             let n = match std::io::BufRead::read_line(&mut reader, &mut line) {
                 Ok(n) => n,

@@ -78,6 +78,10 @@ pub struct ChatConfig {
     pub command_timeout: Duration,
     /// Environment facts older than this are checked again before use.
     pub facts_max_age: Duration,
+    /// Reasoning setting for models that take one (see `engines::reasoning_levels`).
+    pub reasoning: Option<&'static str>,
+    /// Images attached to this turn's message, as `data:` URLs.
+    pub images: Vec<String>,
 }
 impl ChatConfig {
     pub fn new(workspace: &Path) -> Self {
@@ -92,6 +96,8 @@ impl ChatConfig {
             top_p: None,
             command_timeout: Duration::from_secs(300),
             facts_max_age: Duration::from_secs(24 * 3600),
+            reasoning: None,
+            images: Vec::new(),
         }
     }
 }
@@ -171,6 +177,9 @@ fn utility_tool(u: &UtilitySpec) -> ToolSpec {
     ToolSpec { name: u.id.into(), description: u.description.into(), parameters: u.parameters.into() }
 }
 
+/// Asks the user whether Lu may work in a folder: `(what, folder) -> yes`.
+pub type Approver<'a> = dyn Fn(&str, &str) -> bool + 'a;
+
 /// One conversation's loop. Holds references to Lu's parts; cheap to make.
 pub struct ChatLoop<'a> {
     pub recorder: &'a Recorder<'a>,
@@ -181,6 +190,35 @@ pub struct ChatLoop<'a> {
     /// the model needs them; without, every utility the task calls for is shown.
     pub profile: Option<(&'a ProfileStore, ModelRef)>,
     pub config: ChatConfig,
+    /// Set from another thread to stop the turn (the answer so far is kept).
+    pub cancel: CancelToken,
+    /// Asks the user, and waits, whether Lu may work in a folder outside its
+    /// allowed ones: `approve(what, folder)`. `None` (or a no) ends the turn
+    /// at that action; without an approver the model is told it was held.
+    pub approve: Option<&'a Approver<'a>>,
+}
+
+/// An image file as a `data:` URL for the model (at most 20 MB).
+pub fn image_data_url(path: &Path) -> Result<String, String> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        _ => return Err("not an image Lu can show the model".into()),
+    };
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if meta.len() > 20 * 1024 * 1024 {
+        return Err("the image is larger than 20 MB".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+}
+/// Whether Lu can show this file to the model as an image.
+pub fn is_image(path: &Path) -> bool {
+    path.extension().is_some_and(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"))
 }
 
 impl<'a> ChatLoop<'a> {
@@ -223,6 +261,11 @@ impl<'a> ChatLoop<'a> {
             let role = if e.role == "user" { "user" } else { "assistant" };
             messages.push(ChatMessage::new(role, e.content));
         }
+        if !self.config.images.is_empty() {
+            if let Some(m) = messages.iter_mut().rev().find(|m| m.role == "user") {
+                m.images = self.config.images.clone();
+            }
+        }
 
         // Tools: the basic ones and the utilities this task calls for.
         let mut tools = basic_tools();
@@ -238,11 +281,21 @@ impl<'a> ChatLoop<'a> {
         let mut stopped = None;
         let mut answer = String::new();
         let mut speed = None;
+        let you_stopped = "you stopped it".to_owned();
         for round in 0..self.config.max_rounds {
+            if self.cancel.is_cancelled() {
+                stopped = Some(you_stopped.clone());
+                break;
+            }
             let mut on_text = |t: &str| on_event(ChatEvent::Text(t.to_owned()));
-            let options = ChatOptions { max_tokens: self.config.max_tokens, temperature: self.config.temperature, top_p: self.config.top_p };
-            let reply = engine.chat(&messages, &tools, &options, &mut on_text)?;
+            let options = ChatOptions { max_tokens: self.config.max_tokens, temperature: self.config.temperature, top_p: self.config.top_p, reasoning: self.config.reasoning };
+            let reply = engine.chat_with_stop(&messages, &tools, &options, Some(self.cancel.flag()), &mut on_text)?;
             speed = reply.tokens_per_second.or(speed);
+            if reply.finish_reason == "stopped" {
+                answer.push_str(&reply.content);
+                stopped = Some(you_stopped.clone());
+                break;
+            }
             if reply.finish_reason == "loop" {
                 answer.push_str(&reply.content);
                 stopped = Some("the model started repeating itself, so Lu stopped it".to_owned());
@@ -263,7 +316,18 @@ impl<'a> ChatLoop<'a> {
                     ToolLoopVerdict::SameAction { count } => halt = Some(format!("the model asked for the same action {count} times, so Lu stopped the turn")),
                     ToolLoopVerdict::TooManyActions { count } => halt = Some(format!("the turn reached {count} actions, so Lu stopped it")),
                 }
-                let result = if halt.is_some() { "not run: the turn was stopped".to_owned() } else { self.run_tool(&turn_id, round, call, on_event) };
+                if halt.is_none() && self.cancel.is_cancelled() {
+                    halt = Some(you_stopped.clone());
+                }
+                let result = if halt.is_some() {
+                    "not run: the turn was stopped".to_owned()
+                } else {
+                    let (text, end) = self.run_tool(&turn_id, round, call, on_event);
+                    if end.is_some() {
+                        halt = end;
+                    }
+                    text
+                };
                 let mut msg = ChatMessage::new("tool", result);
                 msg.tool_call_id = Some(call.id.clone());
                 messages.push(msg);
@@ -287,16 +351,29 @@ impl<'a> ChatLoop<'a> {
         Ok(TurnOutcome { turn_id, answer, actions, stopped, tokens_per_second: speed })
     }
 
-    /// Run one tool call and return what the model is told.
-    fn run_tool(&self, turn_id: &str, round: u32, call: &ToolCall, on_event: &mut dyn FnMut(ChatEvent)) -> String {
+    /// Run one tool call; returns what the model is told, and why the turn
+    /// must end now (the user did not approve), if it must.
+    fn run_tool(&self, turn_id: &str, round: u32, call: &ToolCall, on_event: &mut dyn FnMut(ChatEvent)) -> (String, Option<String>) {
         let args = match parse_model_boundary(if call.arguments.trim().is_empty() { "{}" } else { &call.arguments }) {
             Ok(p) => p.object,
-            Err(e) => return format!("error: the arguments are not valid JSON ({e:?})"),
+            Err(e) => return (format!("error: the arguments are not valid JSON ({e:?})"), None),
         };
         let c = Call { call_id: format!("{}-{round}-{}", &turn_id[2..14], new_id('c')[2..].chars().take(12).collect::<String>()), turn_id: turn_id.to_owned() };
         let what = describe(&call.name, &args);
         on_event(ChatEvent::ActionStarted { tool: call.name.clone(), what: what.clone() });
-        let result = self.dispatch(&c, &call.name, &args);
+        let mut result = self.dispatch(&c, &call.name, &args);
+        let mut end = None;
+        // Outside the allowed folders: pause and ask the user, if Lu can.
+        if let (Err(ToolFailure::Held(_, Some(folder))), Some(approve)) = (&result, self.approve) {
+            let folder = folder.clone();
+            if approve(&what, &folder) && self.files.allow_folder(Path::new(&folder)).is_ok() {
+                let c2 = Call { call_id: format!("{}-a", c.call_id), turn_id: c.turn_id.clone() };
+                result = self.dispatch(&c2, &call.name, &args);
+            } else {
+                end = Some(if self.cancel.is_cancelled() { "you stopped it".to_owned() } else { "it needed your approval to work in a folder and none was given".to_owned() });
+                result = Err(ToolFailure::Error("not approved by the user".into()));
+            }
+        }
         let (ok, text) = match result {
             Ok(text) => (true, text),
             Err(ToolFailure::Held(reason, folder)) => {
@@ -306,7 +383,7 @@ impl<'a> ChatLoop<'a> {
             Err(ToolFailure::Error(e)) => (false, format!("error: {e}")),
         };
         on_event(ChatEvent::ActionFinished { tool: call.name.clone(), ok, what });
-        text
+        (text, end)
     }
 
     fn dispatch(&self, c: &Call, name: &str, a: &Map<String, Value>) -> Result<String, ToolFailure> {
@@ -318,7 +395,7 @@ impl<'a> ChatLoop<'a> {
                 let cwd = s("cwd").map(|p| self.resolve(&p)).unwrap_or_else(|| self.config.workspace.clone());
                 let timeout = a.get("timeout_seconds").and_then(Value::as_u64).map(Duration::from_secs).unwrap_or(self.config.command_timeout);
                 let req = RunRequest { call_id: c.call_id.clone(), turn_id: c.turn_id.clone(), command, cwd, timeout, snapshot: true };
-                let r = self.runner.run(&req, &CancelToken::default()).map_err(run_failure)?;
+                let r = self.runner.run(&req, &self.cancel).map_err(run_failure)?;
                 let mut out = match (r.exit_code, r.timed_out, r.cancelled) {
                     (_, true, _) => "timed out; the command and everything it started were stopped".to_owned(),
                     (_, _, true) => "cancelled".to_owned(),

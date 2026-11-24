@@ -56,7 +56,7 @@ macro_rules! lu {
         let work = $dir.join("work");
         let files = FileAccess::new(&rec, &snapshots, &gate, WorkingScope::new(std::slice::from_ref(&work)).unwrap(), SnapshotLimits::default());
         let runner = CommandRunner::new(&rec, &snapshots, &gate, SnapshotLimits::default(), &$dir.join("lu-data/runner")).unwrap();
-        let $chat = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: None, profile: None, config: ChatConfig::new(&work) };
+        let $chat = ChatLoop { recorder: &rec, files: &files, runner: &runner, environment: None, profile: None, config: ChatConfig::new(&work), cancel: Default::default(), approve: None };
     };
 }
 
@@ -163,3 +163,59 @@ fn folders_named_by_the_user_count_and_others_do_not() {
     assert!(lu_core::chat::folders_named("no paths here, just C: words").is_empty());
 }
 
+
+#[test]
+fn lu_pauses_for_approval_and_continues_or_ends_the_turn() {
+    // Yes: the folder is allowed for the rest of the turn and the write runs.
+    let dir = base("approve-yes");
+    let mut e = engine(&dir);
+    lu!(dir, chat, book);
+    let outside = dir.join("other").join("yes.txt");
+    fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    let asked = std::cell::Cell::new(0);
+    let yes = |_: &str, folder: &str| {
+        asked.set(asked.get() + 1);
+        assert!(folder.ends_with("other"), "{folder}");
+        true
+    };
+    let chat = ChatLoop { approve: Some(&yes), ..chat };
+    let text = format!(r#"TOOL:write_file:{{"path":{},"content":"ok"}}"#, serde_json::to_string(&outside.to_string_lossy()).unwrap());
+    let out = chat.turn(&mut e, &text, &mut |_| {}).unwrap();
+    assert_eq!(asked.get(), 1);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "ok");
+    assert!(out.stopped.is_none(), "{:?}", out.stopped);
+    let _ = book;
+
+    // No (or the timer ran out): nothing is written and the turn ends there.
+    let dir = base("approve-no");
+    let mut e = engine(&dir);
+    lu!(dir, chat, book);
+    let outside = dir.join("no.txt");
+    let no = |_: &str, _: &str| false;
+    let chat = ChatLoop { approve: Some(&no), ..chat };
+    let text = format!(r#"TOOL:write_file:{{"path":{},"content":"x"}}"#, serde_json::to_string(&outside.to_string_lossy()).unwrap());
+    let out = chat.turn(&mut e, &text, &mut |_| {}).unwrap();
+    assert!(!outside.exists());
+    assert!(out.stopped.as_deref().unwrap().contains("approval"), "{:?}", out.stopped);
+    let _ = book;
+}
+
+#[test]
+fn a_stopped_turn_ends_with_what_was_written_so_far() {
+    let dir = base("stop");
+    let mut e = engine(&dir);
+    lu!(dir, chat, book);
+    chat.cancel.cancel();
+    let out = chat.turn(&mut e, "hi", &mut |_| {}).unwrap();
+    assert_eq!(out.stopped.as_deref(), Some("you stopped it"));
+    let _ = book;
+}
+
+#[test]
+fn reasoning_levels_follow_the_chat_template() {
+    use lu_core::engines::reasoning_levels;
+    assert_eq!(reasoning_levels("{% if reasoning_effort %}"), ["low", "medium", "high"]);
+    assert_eq!(reasoning_levels("{% if enable_thinking %}"), ["off", "on"]);
+    assert_eq!(reasoning_levels("{% if enable_thinking %}{{ reasoning_effort }}"), ["off", "low", "medium", "high"]);
+    assert!(reasoning_levels("plain").is_empty());
+}

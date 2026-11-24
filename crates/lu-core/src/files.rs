@@ -327,11 +327,22 @@ pub struct FileAccess<'a> {
     recorder: &'a Recorder<'a>,
     snapshots: &'a SnapshotStore,
     gate: &'a OriginGate,
-    scope: WorkingScope,
+    scope: std::sync::Mutex<WorkingScope>,
     limits: SnapshotLimits,
 }
 
 impl<'a> FileAccess<'a> {
+    /// The user allowed one more folder during this turn.
+    pub fn allow_folder(&self, folder: &Path) -> Result<(), FileError> {
+        let root = resolve(folder)?;
+        if let Ok(mut s) = self.scope.lock() {
+            if !s.roots.contains(&root) {
+                s.roots.push(root);
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         recorder: &'a Recorder<'a>,
         snapshots: &'a SnapshotStore,
@@ -339,7 +350,7 @@ impl<'a> FileAccess<'a> {
         scope: WorkingScope,
         limits: SnapshotLimits,
     ) -> Self {
-        Self { recorder, snapshots, gate, scope, limits }
+        Self { recorder, snapshots, gate, scope: std::sync::Mutex::new(scope), limits }
     }
 
     /// Ask the origin gate whether this action runs.
@@ -384,7 +395,7 @@ impl<'a> FileAccess<'a> {
 
     fn writable(&self, path: &Path) -> Result<PathBuf, FileError> {
         let target = resolve(path)?;
-        if !self.scope.contains(&target) {
+        if !self.scope.lock().map(|s| s.contains(&target)).unwrap_or(false) {
             return Err(FileError::Held {
                 path: target,
                 reason: "outside the working scope; the user's instruction did not name it".into(),

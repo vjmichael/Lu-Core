@@ -5,6 +5,8 @@ const state = {
   current: null, status: { state: "unloaded" }, models: [],
   // Answers being written, per conversation: { text, items: [{kind, text, ok, folder}], body, waiting }.
   streams: new Map(),
+  // What is typed and attached, per conversation ("new" before the first message).
+  drafts: new Map(), attach: new Map(),
 };
 const tree = $("#tree"), messages = $("#messages"), input = $("#input"), sendBtn = $("#send");
 
@@ -144,8 +146,25 @@ function showEmpty() {
     el("div", { text: state.status.state === "loaded" ? `${state.status.model} is ready.` : "Choose a model at the top right to begin." }))));
 }
 
+const dkey = () => state.current || "new";
+function saveDraft() { state.drafts.set(dkey(), input.value); }
+function restoreDraft() { input.value = state.drafts.get(dkey()) || ""; autosize(); drawAttach(); }
+function attachments() { if (!state.attach.has(dkey())) state.attach.set(dkey(), []); return state.attach.get(dkey()); }
+function drawAttach() {
+  const box = $("#attach");
+  box.textContent = "";
+  const list = attachments();
+  for (const p of list) {
+    box.append(el("span", { class: "file-chip", title: p }, fileIcon(p), el("span", { class: "n", text: baseName(p) }),
+      el("button", { class: "x", title: "Remove", onclick: () => { list.splice(list.indexOf(p), 1); drawAttach(); } }, "×")));
+  }
+  box.classList.toggle("hidden", !list.length);
+}
+const baseName = (p) => p.split(/[\\/]/).pop();
+const fileIcon = (p) => el("span", { text: /\.(png|jpe?g|webp|gif|bmp)$/i.test(p) ? "🖼" : "📄" });
+
 async function openChat(id) {
-  state.current = id;
+  if (state.current !== id) { saveDraft(); state.current = id; restoreDraft(); }
   const chat = state.chats.find((c) => c.id === id);
   $("#title").textContent = chat ? chat.title : "Conversation";
   const list = await call("chat_messages", { id });
@@ -163,6 +182,7 @@ async function openChat(id) {
     s.body = addMessage("lu", "");
     s.body.classList.add("caret");
     for (const it of s.items) drawItem(s, it);
+    s.body._raw = s.text;
     if (s.waiting) s.body.append(waitingNote());
     else renderReply(s.text, s.body);
   }
@@ -177,13 +197,47 @@ function drawTreeSelection() {
   $("#search").value.trim() ? runSearch() : drawTree();
 }
 
+// A user message is stored as its text plus one "[Attached] path" line per file.
+function splitAttached(text) {
+  const files = [], lines = [];
+  for (const l of text.split("\n")) { const m = l.match(/^\[Attached\] (.+)$/); m ? files.push(m[1]) : lines.push(l); }
+  return { text: lines.join("\n").trim(), files };
+}
 function addMessage(role, text) {
   if (messages.querySelector(".empty")) messages.textContent = "";
   const body = el("div", { class: "body" });
-  if (role === "user") body.textContent = text; else renderReply(text, body);
-  const m = el("div", { class: "msg " + (role === "user" ? "user" : "lu") }, body);
+  body._raw = text;
+  const m = el("div", { class: "msg " + (role === "user" ? "user" : "lu") });
+  if (role === "user") {
+    const { text: t, files } = splitAttached(text);
+    if (t) { body.textContent = t; m.append(body); }
+    if (files.length) m.append(el("div", { class: "attachments" }, files.map((p) => el("span", { class: "file-chip", title: p }, fileIcon(p), el("span", { class: "n", text: baseName(p) })))));
+  } else {
+    renderReply(text, body);
+    m.append(body);
+  }
+  const copy = el("button", { title: "Copy", onclick: async () => {
+    const raw = role === "user" ? splitAttached(body._raw).text : body._raw;
+    try { await navigator.clipboard.writeText(raw); toast("Copied."); } catch { toast("Could not copy."); }
+  } }, "Copy");
+  const tools = el("div", { class: "msg-tools" }, copy);
+  if (role !== "user") tools.append(el("button", { title: "Ask again", onclick: () => retry(m) }, "Retry"));
+  m.append(tools);
   messages.append(m);
   return body;
+}
+// Send the user message before this answer again.
+function retry(answer) {
+  if (state.current && state.streams.has(state.current)) return toast("Lu is still answering in this conversation.");
+  let prev = answer.previousElementSibling;
+  while (prev && !prev.classList.contains("user")) prev = prev.previousElementSibling;
+  const body = prev?.querySelector(".body") || prev;
+  const raw = prev ? (prev.querySelector(".body")?._raw ?? null) : null;
+  const src = raw ?? (prev ? prev.textContent : null);
+  if (!src) return toast("Nothing to ask again.");
+  const { text, files } = splitAttached(src);
+  sendText(text, files);
+  void body;
 }
 function scrollDown(force) {
   const t = $("#thread");
@@ -199,22 +253,29 @@ async function newChat(folder = null) {
 
 async function send() {
   const text = input.value.trim();
-  if (!text) return;
+  const files = [...attachments()];
+  if (!text && !files.length) return;
   if (state.current && state.streams.has(state.current)) { toast("Lu is still answering in this conversation."); return; }
   if (state.status.state !== "loaded") { toast("Load a model first: use the model button at the top right."); return; }
+  input.value = ""; autosize();
+  attachments().length = 0; drawAttach();
+  state.drafts.delete(dkey());
+  await sendText(text, files);
+}
+async function sendText(text, files) {
   if (!state.current) {
     state.current = await call("new_chat", { folder: null });
     messages.textContent = "";
   }
-  input.value = ""; autosize();
-  addMessage("user", text);
+  const shown = files.length ? `${text}\n${files.map((f) => `\n[Attached] ${f}`).join("")}` : text;
+  addMessage("user", shown);
   const chat = state.current;
   const body = addMessage("lu", "");
   body.classList.add("caret");
   state.streams.set(chat, { text: "", items: [], body, waiting: false, user: text });
   setBusy();
   scrollDown(true);
-  try { await call("send_message", { chat, text }); }
+  try { await call("send_message", { chat, text, attachments: files, reasoning: reasoningChoice() }); }
   catch (e) { endStream(chat); toast(String(e)); }
 }
 
@@ -227,9 +288,11 @@ function endStream(chat) {
 }
 function setBusy() {
   const b = !!state.current && state.streams.has(state.current);
-  sendBtn.disabled = b;
-  $("#hint").textContent = b ? "Lu is answering…" : "Enter to send · Shift+Enter for a new line";
+  sendBtn.textContent = b ? "Stop" : "Send";
+  sendBtn.classList.toggle("danger", b);
+  $("#hint").textContent = b ? "Lu is answering… Esc or Stop to stop it" : "Enter to send · Shift+Enter for a new line · drop files to attach";
 }
+function stopCurrent() { if (state.current && state.streams.has(state.current)) call("stop_chat", { chat: state.current }); }
 const shown = (chat, s) => chat === state.current && s.body?.isConnected;
 
 function drawItem(s, it) {
@@ -238,6 +301,10 @@ function drawItem(s, it) {
   if (it.kind === "action") {
     it.node = el("div", { class: "action " + (it.ok == null ? "running" : it.ok ? "done" : "failed"), text: it.text });
     row.before(it.node);
+  } else if (it.kind === "note") {
+    row.before(el("div", { class: "note-line", text: it.text }));
+  } else if (it.kind === "approval") {
+    drawApproval(row, it);
   } else if (it.kind === "held") {
     const n = el("div", { class: "notice" }, el("div", { text: it.text }));
     if (it.folder) {
@@ -255,6 +322,32 @@ function drawItem(s, it) {
   }
 }
 
+function drawApproval(row, it) {
+  const card = el("div", { class: "approval" });
+  it.node = card;
+  row.before(card);
+  paintApproval(it);
+}
+function paintApproval(it) {
+  const card = it.node;
+  if (!card?.isConnected) return;
+  card.textContent = "";
+  card.append(el("div", { class: "q", text: `${it.what} needs a folder Lu is not allowed to work in yet:` }), el("div", { class: "f", text: it.folder }));
+  if (it.answer) {
+    const said = { once: "Allowed for this answer.", always: "Allowed. Lu will remember this folder.", deny: "Not allowed. Lu stopped.", timeout: "No answer in time. Lu stopped; send a new message to try again.", stopped: "Stopped." }[it.answer] || it.answer;
+    card.append(el("div", { class: "muted", text: said }));
+    return;
+  }
+  const answer = (choice) => call("answer_approval", { id: it.id, choice }).catch((e) => toast(String(e)));
+  const left = Math.max(0, Math.ceil((it.deadline - Date.now()) / 1000));
+  card.append(el("div", { class: "btns" },
+    el("button", { class: "btn primary", onclick: () => answer("once") }, "Allow"),
+    el("button", { class: "btn", onclick: () => answer("always") }, "Always allow this folder"),
+    el("button", { class: "btn ghost", onclick: () => answer("deny") }, "Don’t allow"),
+    el("span", { class: "t", text: `Waiting ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}` })));
+}
+setInterval(() => { for (const s of state.streams.values()) for (const it of s.items) if (it.kind === "approval" && !it.answer) paintApproval(it); }, 1000);
+
 on("chat-event", (ev) => {
   let s = state.streams.get(ev.chat);
   if (!s) {
@@ -271,7 +364,20 @@ on("chat-event", (ev) => {
     if (vis) s.body.textContent = "";
   } else if (ev.type === "text") {
     s.text += ev.text;
+    if (s.body) s.body._raw = s.text;
     if (vis) { renderReply(s.text, s.body); scrollDown(); }
+  } else if (ev.type === "note") {
+    const it = { kind: "note", text: ev.text };
+    s.items.push(it);
+    if (vis) drawItem(s, it);
+  } else if (ev.type === "approval") {
+    const it = { kind: "approval", id: ev.id, what: ev.what, folder: ev.folder, deadline: Date.now() + ev.seconds * 1000 };
+    s.items.push(it);
+    if (vis) { drawItem(s, it); scrollDown(true); }
+    else toast("Lu is waiting for your approval in another conversation.", 6000);
+  } else if (ev.type === "approval-done") {
+    const it = s.items.find((x) => x.id === ev.id);
+    if (it) { it.answer = ev.answer; paintApproval(it); }
   } else if (ev.type === "action") {
     const it = { kind: "action", text: ev.text, ok: null };
     s.items.push(it);
@@ -308,9 +414,9 @@ function T_drop() {
     if (p.type === "enter" || p.type === "over") comp.classList.add("drop-target");
     else comp.classList.remove("drop-target");
     if (p.type === "drop" && p.paths?.length) {
-      const add = p.paths.join("\n");
-      input.value = input.value.trim() ? input.value.replace(/\s*$/, "\n") + add + "\n" : add + "\n";
-      autosize(); input.focus();
+      const list = attachments();
+      for (const f of p.paths) if (!list.includes(f)) list.push(f);
+      drawAttach(); input.focus();
     }
   });
 }
@@ -324,7 +430,32 @@ on("library-changed", () => refresh().then(() => {
 function autosize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 220) + "px"; }
 input.addEventListener("input", autosize);
 input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
-sendBtn.addEventListener("click", send);
+sendBtn.addEventListener("click", () => (state.current && state.streams.has(state.current) ? stopCurrent() : send()));
+addEventListener("keydown", (e) => { if (e.key === "Escape") stopCurrent(); });
+
+// Reasoning: shown only for models whose template takes it.
+const reasonLabel = { off: "Thinking off", on: "Thinking on", low: "Reasoning: Low", medium: "Reasoning: Medium", high: "Reasoning: High" };
+function reasoningChoice() {
+  const levels = state.status.reasoning || [];
+  if (!levels.length) return null;
+  let v = null;
+  try { v = localStorage.getItem("lu-reasoning"); } catch {}
+  return levels.includes(v) ? v : levels.includes("medium") ? "medium" : levels.includes("on") ? "on" : levels[0];
+}
+function drawReasoning() {
+  const b = $("#reasoning");
+  const v = reasoningChoice();
+  b.classList.toggle("hidden", !v);
+  if (v) b.textContent = reasonLabel[v] || v;
+}
+$("#reasoning").addEventListener("click", (e) => {
+  const r = e.currentTarget.getBoundingClientRect();
+  const cur = reasoningChoice();
+  menu(r.left, r.top - 40 * (state.status.reasoning.length + 1), state.status.reasoning.map((l) => ({
+    label: (l === cur ? "● " : "") + (reasonLabel[l] || l),
+    run: () => { try { localStorage.setItem("lu-reasoning", l); } catch {} drawReasoning(); },
+  })));
+});
 $("#new-chat").addEventListener("click", () => newChat());
 $("#new-folder").addEventListener("click", async () => {
   const n = await promptBox("New folder", "", "Folder name", "Create");
@@ -356,6 +487,7 @@ function drawStatus(st) {
   bar.firstElementChild.style.width = Math.round((st.progress || 0) * 100) + "%";
   if (st.state === "error" && st.message) toast(st.message, 8000);
   if (messages.querySelector(".empty")) showEmpty();
+  drawReasoning();
 }
 on("model-status", drawStatus);
 
