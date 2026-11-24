@@ -1293,7 +1293,8 @@ impl LlamaServer {
         cmd.args(["--ctx-size", &self.settings.context.to_string(), "--n-gpu-layers", &layers.to_string(), "--parallel", "1", "--no-webui", "--jinja"]);
         // Fully on the GPU: do not keep a mapped copy of the file in RAM too.
         if variant.uses_gpu() && self.settings.gpu_layers.is_none() {
-            cmd.arg("--no-mmap");
+            // b12651 replaced --no-mmap with --load-mode.
+            cmd.args(["--load-mode", "none"]);
         }
         if let Some(t) = self.settings.threads {
             cmd.args(["--threads", &t.to_string()]);
