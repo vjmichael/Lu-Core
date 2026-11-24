@@ -7,7 +7,11 @@
 //! - `FAIL_LOAD`: exit with a load error, like a backend that cannot use
 //!   this GPU;
 //! - `CRASH_AFTER_LOAD`: become healthy, then exit on the first completion;
-//! - `SLOW_LOAD_MS` (contents: milliseconds): delay before healthy.
+//! - `SLOW_LOAD_MS` (contents: milliseconds): delay before healthy;
+//! - `NO_DEVICES`: `--list-devices` shows no GPU (a GPU build that cannot
+//!   see this machine's GPU);
+//! - `CPU_ONLY`: loads, but reports 0 layers offloaded (llama.cpp's quiet
+//!   fall back to the CPU).
 //!
 //! `--version` prints a version line like the real server.
 
@@ -28,6 +32,13 @@ fn main() {
         println!("built with lu test for {}", env::consts::OS);
         return;
     }
+    if args.iter().any(|a| a == "--list-devices") {
+        println!("Available devices:");
+        if !here.join("NO_DEVICES").exists() {
+            println!("  TEST0: Lu Test GPU (8192 MiB, 8000 MiB free)");
+        }
+        return;
+    }
     let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
     let port: u16 = value("--port").and_then(|p| p.parse().ok()).unwrap_or(0);
     let key = value("--api-key").unwrap_or_default();
@@ -42,6 +53,9 @@ fn main() {
         std::process::exit(1);
     }
     let crash_after_load = here.join("CRASH_AFTER_LOAD").exists();
+    let layers: u32 = value("--n-gpu-layers").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let on_gpu = if here.join("CPU_ONLY").exists() { 0 } else { layers.min(33) };
+    eprintln!("load_tensors: offloaded {on_gpu}/33 layers to GPU");
     let slow: u64 = fs::read_to_string(here.join("SLOW_LOAD_MS")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
     let ready_at = std::time::Instant::now() + Duration::from_millis(slow);

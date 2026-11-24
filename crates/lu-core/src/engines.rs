@@ -360,14 +360,32 @@ fn find_server(dir: &Path, depth: usize) -> Option<PathBuf> {
     subdirs.into_iter().find_map(|d| find_server(&d, depth - 1))
 }
 
-/// Run `server --version` in an owned process tree; its version line.
-fn smoke(server: &Path) -> Result<String, String> {
+/// Run the server with `args` in an owned process tree (60 s limit) and
+/// return whether it succeeded and everything it printed.
+fn run_capture(server: &Path, args: &[&str]) -> Result<(bool, String), String> {
     let mut cmd = Command::new(server);
-    cmd.arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(dir) = server.parent() {
         cmd.current_dir(dir);
     }
     let (mut child, tree) = ProcessTree::spawn(cmd).map_err(|e| format!("it does not start: {e}"))?;
+    // Read both pipes on threads so a chatty process cannot block on a full pipe.
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    let t_out = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(o) = out.as_mut() {
+            let _ = o.read_to_string(&mut s);
+        }
+        s
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(e) = err.as_mut() {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
     let until = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(s) = child.try_wait().map_err(|e| e.to_string())? {
@@ -375,22 +393,60 @@ fn smoke(server: &Path) -> Result<String, String> {
         }
         if Instant::now() > until {
             tree.kill();
-            return Err("it did not answer --version within 60 s".into());
+            return Err(format!("it did not finish {} within 60 s", args.join(" ")));
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let mut text = String::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_string(&mut text);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut text);
-    }
+    let text = format!("{}{}", t_out.join().unwrap_or_default(), t_err.join().unwrap_or_default());
+    Ok((status.success(), text))
+}
+
+/// Run `server --version`; its version line.
+fn smoke(server: &Path) -> Result<String, String> {
+    let (ok, text) = run_capture(server, &["--version"])?;
     let line = text.lines().find(|l| l.to_ascii_lowercase().contains("version")).map(str::to_owned);
-    match (status.success(), line) {
+    match (ok, line) {
         (true, Some(l)) => Ok(l.trim().to_owned()),
-        (_, _) => Err(format!("--version failed: {}", text.lines().last().unwrap_or("no output").trim())),
+        _ => Err(format!("--version failed: {}", text.lines().last().unwrap_or("no output").trim())),
     }
+}
+
+/// The devices a build can use, from `llama-server --list-devices`
+/// (lines like `ROCm0: AMD Radeon AI PRO R9700 (32624 MiB, 32000 MiB free)`).
+/// Returns the device lines and the full output, for reporting.
+pub fn list_devices(server: &Path) -> Result<(Vec<String>, String), String> {
+    let (_, text) = run_capture(server, &["--list-devices"])?;
+    let mut devices = Vec::new();
+    let mut in_list = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("Available devices") {
+            in_list = true;
+            continue;
+        }
+        if in_list {
+            let t = line.trim();
+            if t.contains(':') && t.split(':').next().is_some_and(|n| !n.is_empty() && !n.contains(' ')) {
+                devices.push(t.to_owned());
+            }
+        }
+    }
+    Ok((devices, text))
+}
+
+/// GPU devices among `devices` (anything that is not the CPU).
+fn gpu_devices(devices: &[String]) -> Vec<String> {
+    devices.iter().filter(|d| !d.to_ascii_uppercase().starts_with("CPU")).cloned().collect()
+}
+
+/// `(offloaded, total)` from a llama.cpp load log ("offloaded 65/65 layers to GPU").
+pub fn offloaded_layers(log: &str) -> Option<(u32, u32)> {
+    log.lines().rev().find_map(|l| {
+        let at = l.find("offloaded ")?;
+        let rest = &l[at + "offloaded ".len()..];
+        let (n, rest) = rest.split_once('/')?;
+        let m: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        Some((n.trim().parse().ok()?, m.parse().ok()?))
+    })
 }
 
 // ---------------------------------------------------------------- the store
@@ -564,6 +620,21 @@ impl<'a> EngineStore<'a> {
             }
         }
         let version_line = smoke(&server).map_err(|why| fail(EngineError::SmokeFailed(why), &unpacked))?;
+        // A GPU build that sees no GPU here is not installed: it would only
+        // run on the CPU while claiming to be ROCm or Vulkan.
+        let (devices, listing) = list_devices(&server).map_err(|why| fail(EngineError::SmokeFailed(why), &unpacked))?;
+        if pin.variant.uses_gpu() && gpu_devices(&devices).is_empty() {
+            let lines: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
+            let shown = lines[lines.len().saturating_sub(12)..].join(" | ");
+            return Err(fail(
+                EngineError::SmokeFailed(format!(
+                    "this {} build finds no usable GPU on this machine, so it would run on the CPU. Its device list: {shown}",
+                    pin.variant.as_str()
+                )),
+                &unpacked,
+            ));
+        }
+        let version_line = format!("{version_line}; devices: {}", if devices.is_empty() { "none".to_owned() } else { devices.join(", ") });
         // Into place: the extracted folder is renamed, then registered.
         let rel = server.strip_prefix(&unpacked).map_err(|_| EngineError::Invalid("server path".into()))?.to_path_buf();
         if dir.exists() {
@@ -754,6 +825,14 @@ fn random_key() -> String {
     h.update(addr.to_le_bytes());
     format!("{:x}", h.finalize())
 }
+/// GPU memory in use on all GPUs, when measurable.
+fn gpu_used_mib() -> Option<u64> {
+    let gpus = resources::measure(None).gpus;
+    if gpus.is_empty() {
+        return None;
+    }
+    gpus.iter().map(|g| g.used_mib).sum()
+}
 fn tail(path: &Path, lines: usize) -> String {
     let text = fs::read_to_string(path).unwrap_or_default();
     let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -779,6 +858,9 @@ impl LlamaServer {
         self.running.as_ref().map(|r| r.log.as_path())
     }
     /// Log lines about devices and GPU offload, to see where the model runs.
+    pub fn log_tail(&self, lines: usize) -> String {
+        self.log_path().map(|p| tail(p, lines)).unwrap_or_default()
+    }
     pub fn device_report(&self) -> Vec<String> {
         let Some(path) = self.log_path() else { return Vec::new() };
         let text = fs::read_to_string(path).unwrap_or_default();
@@ -823,6 +905,7 @@ impl LlamaServer {
             cmd.current_dir(dir);
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file));
+        let used_before = gpu_used_mib();
         let started = Instant::now();
         let (mut child, tree) = ProcessTree::spawn(cmd).map_err(|e| fail(format!("{} does not start: {e}", self.build.server.display())))?;
         let health = format!("http://127.0.0.1:{port}/health");
@@ -842,7 +925,27 @@ impl LlamaServer {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        self.running = Some(Running { child, tree, port, key, log, model: model.to_owned(), loaded_ms: started.elapsed().as_millis() as u64 });
+        let loaded_ms = started.elapsed().as_millis() as u64;
+        // A GPU backend must really have put the model on the GPU. llama.cpp
+        // quietly runs on the CPU when it cannot use the GPU; that is a
+        // failure of this backend, not a slow success.
+        if variant.uses_gpu() && layers > 0 {
+            let text = fs::read_to_string(&log).unwrap_or_default();
+            let grew = used_before.zip(gpu_used_mib()).map(|(b, a)| a.saturating_sub(b));
+            let verdict = match (offloaded_layers(&text), grew) {
+                (Some((0, total)), _) => Err(format!("no layers went to the GPU (0 of {total}); it ran on the CPU")),
+                (Some(_), _) => Ok(()),
+                (None, Some(g)) if g >= 256 => Ok(()),
+                (None, Some(g)) => Err(format!("GPU memory grew by only {g} MiB while loading; it ran on the CPU")),
+                (None, None) => Err("could not confirm the model is on the GPU (no offload line in the log, GPU memory not measurable)".into()),
+            };
+            if let Err(why) = verdict {
+                tree.kill();
+                let _ = child.wait();
+                return Err(fail(format!("{why}. Engine log: {}", tail(&log, 4))));
+            }
+        }
+        self.running = Some(Running { child, tree, port, key, log, model: model.to_owned(), loaded_ms });
         Ok(())
     }
 

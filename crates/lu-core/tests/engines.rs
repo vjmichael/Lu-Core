@@ -1,7 +1,7 @@
 use lu_core::{
     ansf::AnsfStore,
     ansf_live_chat::{LiveEvent, LiveKind},
-    engines::{load_with_fallback, parse_pins, platform, shipped_pins, EngineError, EngineSource, EngineStore, LlamaServer, Pin, RunSettings, Variant, PINS_JSON},
+    engines::{list_devices, load_with_fallback, offloaded_layers, parse_pins, platform, shipped_pins, EngineError, EngineSource, EngineStore, LlamaServer, Pin, RunSettings, Variant, PINS_JSON},
     gguf,
     journal::EffectJournal,
     origin::{OriginGate, Source, SourceKind},
@@ -360,6 +360,52 @@ fn the_model_owner_runs_the_engine_and_a_crash_is_reported_plainly() {
 }
 
 #[test]
+fn a_gpu_build_that_would_run_on_the_cpu_is_never_a_pass() {
+    let lu = lu("cpuonly");
+    let turn = say(&lu, 1, "Install the engines");
+    let (ext, good) = release(&[], None);
+    let (_, blind) = release(&["NO_DEVICES"], None);
+    let (_, quiet_cpu) = release(&["CPU_ONLY"], None);
+    let blind_pin = pin("b100", Variant::Rocm, &ext, &blind);
+    let quiet_pin = pin("b200", Variant::Rocm, &ext, &quiet_cpu);
+    let vulkan_pin = pin("b100", Variant::Vulkan, &ext, &good);
+    let mut assets = HashMap::new();
+    for (p, b) in [(&blind_pin, &blind), (&quiet_pin, &quiet_cpu), (&vulkan_pin, &good)] {
+        assets.insert(format!("/{}/{}", p.version, p.asset), b.clone());
+    }
+    let src = EngineSource::local_test(&source(assets)).unwrap();
+    let rec = Recorder::new(&lu.book, &lu.journal, "c-1");
+    let store = EngineStore::open(&lu.dir.join("engines"), vec![blind_pin.clone(), quiet_pin.clone(), vulkan_pin.clone()], &src, &rec, &lu.gate, &lu.governor).unwrap();
+    // A ROCm build that lists no GPU is refused at install, with its own words.
+    match store.install("e-1", &turn, &blind_pin, true, &AtomicBool::new(false), &mut no_progress()) {
+        Err(EngineError::SmokeFailed(why)) => assert!(why.contains("finds no usable GPU") && why.contains("Available devices"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(store.active(Variant::Rocm).unwrap().is_none());
+    // One that lists a GPU but then loads with 0 layers on it is a failed
+    // load, and Lu falls back to Vulkan instead of reporting a slow success.
+    let rocm = store.install("e-2", &turn, &quiet_pin, true, &AtomicBool::new(false), &mut no_progress()).unwrap();
+    let (devices, _) = list_devices(&rocm.server).unwrap();
+    assert_eq!(devices, ["TEST0: Lu Test GPU (8192 MiB, 8000 MiB free)"]);
+    store.install("e-3", &turn, &vulkan_pin, true, &AtomicBool::new(false), &mut no_progress()).unwrap();
+    let model = model_file(&lu.dir);
+    let m = model.to_string_lossy().into_owned();
+    let settings = RunSettings { load_timeout: Duration::from_secs(30), ..RunSettings::default() };
+    let (server, failed) = load_with_fallback(&store, &m, true, &settings, &lu.dir.join("logs")).unwrap();
+    assert_eq!(server.build.variant, Variant::Vulkan);
+    assert!(failed[0].starts_with("rocm:") && failed[0].contains("ran on the CPU"), "{failed:?}");
+    assert!(server.device_report().iter().any(|l| l.contains("offloaded 33/33")));
+    let rocm_record = store.records(&m).unwrap().into_iter().find(|r| r.variant == Variant::Rocm).unwrap();
+    assert!(!rocm_record.ok && rocm_record.note.unwrap().contains("0 of 33"));
+    // CPU on purpose (0 GPU layers) is not checked for offload.
+    let mut cpu_by_choice = LlamaServer::new(server.build.clone(), RunSettings { gpu_layers: Some(0), load_timeout: Duration::from_secs(30), ..RunSettings::default() }, &lu.dir.join("logs"));
+    cpu_by_choice.load(&m).unwrap();
+    assert_eq!(offloaded_layers("x\nload_tensors: offloaded 65/65 layers to GPU\n"), Some((65, 65)));
+    assert_eq!(offloaded_layers("load_tensors: offloaded 0/65 layers to GPU"), Some((0, 65)));
+    assert_eq!(offloaded_layers("nothing here"), None);
+}
+
+#[test]
 #[ignore = "owner test: downloads a real llama.cpp build from GitHub (set LU_TEST_GGUF to also load a model)"]
 fn real_engine_install_and_load() {
     let lu = lu("real");
@@ -382,15 +428,29 @@ fn real_engine_install_and_load() {
         })
         .unwrap();
     println!("installed {} {} -> {}", build.variant.as_str(), build.version, build.server.display());
+    match list_devices(&build.server) {
+        Ok((devices, _)) => println!("devices this build sees: {devices:?}"),
+        Err(e) => println!("could not list devices: {e}"),
+    }
     if let Ok(model) = std::env::var("LU_TEST_GGUF") {
         let gpu = !lu_core::resources::measure(None).gpus.is_empty();
-        let (mut server, failed) = load_with_fallback(&store, &model, gpu, &RunSettings::default(), &lu.dir.join("logs")).unwrap();
+        let (mut server, failed) = match load_with_fallback(&store, &model, gpu, &RunSettings::default(), &lu.dir.join("logs")) {
+            Ok(x) => x,
+            Err(e) => {
+                println!("no backend could run the model on this machine:");
+                for r in store.records(&model).unwrap() {
+                    println!("  {} {}: {}", r.variant.as_str(), r.version, r.note.unwrap_or_default());
+                }
+                panic!("{e}");
+            }
+        };
         println!("loaded on {} in {:?} ms; failed first: {failed:?}", server.build.variant.as_str(), server.load_ms());
         println!("--- engine log: devices and offload ---");
         for line in server.device_report() {
             println!("  {line}");
         }
         println!("--- end of log extract ---");
+        println!("--- last lines of the engine log ---\n{}", server.log_tail(25).replace(" | ", "\n"));
         let c = server.complete("The capital of France is", 16).unwrap();
         println!("reply: {:?} at {:?} tokens/s", c.text, c.tokens_per_second);
     }
