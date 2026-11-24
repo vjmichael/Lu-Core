@@ -1109,13 +1109,23 @@ impl Default for RunSettings {
     }
 }
 
+/// Reasoning effort values Lu knows, lowest first.
+pub const EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
 /// The reasoning settings a chat template takes, in the order to show
 /// them: `low`/`medium`/`high` when it reads `reasoning_effort`, `off`/`on`
 /// when it reads `enable_thinking`, nothing otherwise.
 pub fn reasoning_levels(template: &str) -> Vec<&'static str> {
     let mut out = Vec::new();
     if template.contains("reasoning_effort") {
-        out.extend(["low", "medium", "high"]);
+        // The values the template itself names (it refuses any other),
+        // lowest first; the usual three when it names none.
+        let named: Vec<&'static str> = EFFORTS.iter().copied().filter(|e| template.contains(&format!("'{e}'")) || template.contains(&format!("\"{e}\""))).collect();
+        if named.is_empty() {
+            out.extend(["low", "medium", "high"]);
+        } else {
+            out.extend(named);
+        }
     }
     if template.contains("enable_thinking") {
         out.insert(0, "off");

@@ -419,10 +419,7 @@ fn reasoning_static(r: Option<&str>) -> Option<&'static str> {
     match r? {
         "off" => Some("off"),
         "on" => Some("on"),
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" => Some("high"),
-        _ => None,
+        other => lu_core::engines::EFFORTS.iter().copied().find(|e| *e == other),
     }
 }
 
@@ -989,7 +986,7 @@ fn open_link(url: String) -> R<()> {
         return Err("Lu only opens web addresses (http or https).".into());
     }
     #[cfg(windows)]
-    let r = std::process::Command::new("explorer.exe").arg(u).spawn();
+    let r = std::process::Command::new("rundll32.exe").arg("url.dll,FileProtocolHandler").arg(u).spawn();
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(u).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]

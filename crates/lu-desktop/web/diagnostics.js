@@ -56,9 +56,12 @@ async function checks() {
   body.append(el("div", { class: "row-between" }, el("h3", { text: `${r.title}: ${problems ? problems + " to look at" : "all good"}` }), runButtons(r)), findingList(r.findings));
 }
 
+let drawing = 0;
 async function bench() {
-  page.textContent = "";
+  const mine = ++drawing;
   const st = await call("model_status");
+  if (mine !== drawing || tab !== "bench") return;
+  page.textContent = "";
   const start = (kind, label) => el("button", { class: "btn" + (kind === "memory" ? " primary" : ""), disabled: st.state !== "loaded" || st.busy, onclick: async () => {
     try { await call("dx_benchmark", { kind }); last.bench = { running: kind }; $("#status").textContent = label + " running…"; bench(); } catch (e) { toast(String(e)); }
   } }, label);

@@ -85,7 +85,10 @@ export function mediaItem({ src, caption }) {
     return fig;
   }
   if (!/^https?:\/\//i.test(src)) { fig.append(make("div", { class: "note-line", text: `Not shown: ${src}` })); return fig; }
-  // From the web: wait for the user.
+  // From the web: wait for the user, unless they chose to show web media at once.
+  let auto = false;
+  try { auto = localStorage.getItem("lu-web-media") === "auto"; } catch {}
+  if (auto) { show(src); return fig; }
   let host = "";
   try { host = new URL(src).hostname; } catch {}
   const what = { youtube: "Play video from YouTube", audio: `Play audio from ${host}`, video: `Play video from ${host}`, image: `Show picture from ${host}` }[kind];

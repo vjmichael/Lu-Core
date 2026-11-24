@@ -218,6 +218,9 @@ fn reasoning_levels_follow_the_chat_template() {
     assert_eq!(reasoning_levels("{% if enable_thinking %}"), ["off", "on"]);
     assert_eq!(reasoning_levels("{% if enable_thinking %}{{ reasoning_effort }}"), ["off", "low", "medium", "high"]);
     assert!(reasoning_levels("plain").is_empty());
+    // Qwen3.8 names its own values and refuses others ("high" is not one).
+    let qwen = "{%- set e = reasoning_effort|default('xhigh') %}{%- if e not in ('xhigh', 'medium', 'low') %}{{ raise_exception('x') }}{% endif %}{% if enable_thinking %}";
+    assert_eq!(reasoning_levels(qwen), ["off", "low", "medium", "xhigh"]);
 }
 
 #[test]

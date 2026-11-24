@@ -434,7 +434,7 @@ sendBtn.addEventListener("click", () => (state.current && state.streams.has(stat
 addEventListener("keydown", (e) => { if (e.key === "Escape") stopCurrent(); });
 
 // Reasoning: shown only for models whose template takes it.
-const reasonLabel = { off: "Thinking off", on: "Thinking on", low: "Reasoning: Low", medium: "Reasoning: Medium", high: "Reasoning: High" };
+const reasonLabel = { off: "Thinking off", on: "Thinking on", minimal: "Reasoning: Minimal", low: "Reasoning: Low", medium: "Reasoning: Medium", high: "Reasoning: High", xhigh: "Reasoning: Extra high", max: "Reasoning: Max" };
 function reasoningChoice() {
   const levels = state.status.reasoning || [];
   if (!levels.length) return null;
@@ -511,14 +511,18 @@ $("#model-pill").addEventListener("click", async (e) => {
 
 // ---------------------------------------------------------------- settings
 
+function webMediaAuto() { try { return localStorage.getItem("lu-web-media") === "auto"; } catch { return false; } }
+
 $("#settings").addEventListener("click", async (e) => {
   const r = e.currentTarget.getBoundingClientRect();
   const s = await call("app_settings");
   const cur = themeChoice();
-  menu(r.left, r.top - 225, [
+  menu(r.left, r.top - 275, [
     { label: (cur === "light" ? "● " : "") + "Day", run: () => setTheme("light") },
     { label: (cur === "dark" ? "● " : "") + "Night", run: () => setTheme("dark") },
     { label: (cur === "system" ? "● " : "") + "Follow Windows", run: () => setTheme("system") },
+    "-",
+    { label: (webMediaAuto() ? "● " : "") + "Show web pictures and videos at once", run: () => { try { localStorage.setItem("lu-web-media", webMediaAuto() ? "click" : "auto"); } catch {} toast(webMediaAuto() ? "Web pictures and videos now show at once." : "Web pictures and videos now wait for a click."); } },
     "-",
     { label: "Diagnostics…", run: () => call("open_window", { kind: "diagnostics" }) },
     { label: "Work folder…", run: async () => {
