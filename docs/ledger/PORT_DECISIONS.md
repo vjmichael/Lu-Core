@@ -85,3 +85,11 @@ Ported: Lu-AI-GUI src-tauri/lu-core/src/model_provider_catalog.rs (repo, revisio
 Not ported: model_provider_transport.rs and model_provider_staging.rs, which ran a pinned curl binary with DNS pinning. Replaced by in-process ureq + rustls, redirects followed by Lu only to HTTPS hosts under huggingface.co / hf.co, resume by Range with Content-Range check (a server ignoring Range restarts cleanly), SHA-256 while writing, GGUF check before the rename. mmproj_admission.rs: the rule "pairing is the user's explicit choice, never guessed" kept as a registry column.
 
 Hub file names are not the user's words, so a model-proposed install is held by the origin gate and approved in a later user message (`install_approved`, bound to the exact repo, commit and files). No token handling: gated and private repos are shown as unavailable.
+
+## Piece 13: inference backends and engine updater (new)
+
+Reviewed, not ported: Lu-AI-GUI src-tauri/lu-core/src/persistent_llama_backend.rs (loopback llama-server with an API key and its argument list kept in spirit), compute_runtime.rs, lu-desktop/src-tauri/resources/lu-inference/manifest.json (a single hand-built Vulkan package marked as needing physical verification).
+
+New `engines.rs`: pinned upstream llama.cpp release builds (pins/llama-engines.json, b12651, SHA-256 from GitHub's published digests, read 2026-11-23) for CPU, Vulkan and ROCm on Windows and Linux x64. Staged install with resume, hash check, archive.rs extraction, `--version` smoke test, SQLite registry, activate/rollback, per-model pins and backend results (load time, tokens/s, failure reason), backend order (pin, last success, ROCm, Vulkan, CPU; last failure last), fallback loading, crash detection. LlamaServer implements resources::Engine so the model owner is the only loader.
+
+Test double: src/bin/lu_test_llama_server.rs answers llama-server's command line, /health and /completion for CI; it is not used outside tests.

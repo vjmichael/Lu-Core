@@ -867,12 +867,18 @@ impl<'g, E: Engine> ModelOwner<'g, E> {
             return Err(ResourceError::Busy);
         }
         let sample = self.governor.sample(None);
-        let gpu = match &request.gpu {
+        let found = match &request.gpu {
             Some(id) => sample.gpus.iter().find(|g| &g.id == id),
             None => sample.gpus.first(),
         }
-        .cloned()
-        .ok_or_else(|| ResourceError::Refused(vec!["no such GPU".into()]))?;
+        .cloned();
+        // With no GPU at all, an exclusive request still sets Lu's model
+        // aside: the plug-in gets the machine's memory instead.
+        let gpu = match found {
+            Some(g) => g,
+            None if request.exclusive && request.gpu.is_none() => Gpu { name: "this machine (no GPU)".into(), id: "none".into(), total_mib: 0, used_mib: Some(0) },
+            None => return Err(ResourceError::Refused(vec!["no such GPU".into()])),
+        };
         if let Some(h) = self.leases.values().find(|h| h.lease.gpu == gpu.id && (h.lease.exclusive || request.exclusive)) {
             return Err(ResourceError::Refused(vec![format!("{} is leased to {} for {}", gpu.name, h.lease.requester, h.lease.purpose)]));
         }
@@ -881,7 +887,9 @@ impl<'g, E: Engine> ModelOwner<'g, E> {
             .free_mib()
             .ok_or_else(|| ResourceError::Unmeasured(vec![format!("VRAM in use on {} could not be measured", gpu.name)]))?;
         let available = free.saturating_sub(self.governor.held_for_plugins(&gpu)).saturating_sub(reserve);
-        let ours = self.loaded.as_ref().filter(|l| l.gpu.as_ref() == Some(&gpu.id) && l.gpu_offload).map(|l| l.vram_mib);
+        // Exclusive: Lu's model goes aside wherever it runs. Otherwise only a
+        // model on this GPU is in the way.
+        let ours = self.loaded.as_ref().filter(|l| request.exclusive || (l.gpu.as_ref() == Some(&gpu.id) && l.gpu_offload)).map(|l| l.vram_mib);
         let fits_now = !request.exclusive && available >= request.vram_mib;
         let mut set_aside = false;
         if !fits_now {

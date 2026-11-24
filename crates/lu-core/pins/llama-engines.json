@@ -1,0 +1,13 @@
+{
+  "schema": "lu-engine-pins-v1",
+  "source": "https://github.com/ggml-org/llama.cpp/releases",
+  "note": "Pinned llama.cpp release builds. Hashes are the SHA-256 digests GitHub publishes for each asset, read on 2026-11-23. Lu installs only builds listed here; a download that does not match is deleted.",
+  "builds": [
+    { "version": "b12651", "variant": "cpu",    "platform": "windows-x64", "asset": "llama-b12651-bin-win-cpu-x64.zip",          "bytes": 25096571,  "sha256": "b2d794fa7587aba29f654d717ff9b73e31caeabf50a7766692903008bbe0855d" },
+    { "version": "b12651", "variant": "vulkan", "platform": "windows-x64", "asset": "llama-b12651-bin-win-vulkan-x64.zip",       "bytes": 38939211,  "sha256": "e58fa9a137d8046c69334005ad6fb3e904ddc7e56f2a61ad1b844335826ef3f4" },
+    { "version": "b12651", "variant": "rocm",   "platform": "windows-x64", "asset": "llama-b12651-bin-win-rocm-10.0-x64.zip",    "bytes": 284457025, "sha256": "2773845442fee43a21031f6d264bc1f41a870be7980892e2cd7a2d46cedc30bd" },
+    { "version": "b12651", "variant": "cpu",    "platform": "linux-x64",   "asset": "llama-b12651-bin-ubuntu-x64.tar.gz",        "bytes": 23297838,  "sha256": "17b242259181d5b1b1f7719aba27929700a8b0dab39bfaef1b971a992b397b38" },
+    { "version": "b12651", "variant": "vulkan", "platform": "linux-x64",   "asset": "llama-b12651-bin-ubuntu-vulkan-x64.tar.gz", "bytes": 36976824,  "sha256": "0bbcf2093f15c64c8a9bf54b809c9b2c812b982992dc2fbc9b36720c1d32cf13" },
+    { "version": "b12651", "variant": "rocm",   "platform": "linux-x64",   "asset": "llama-b12651-bin-ubuntu-rocm-10.0-x64.tar.gz", "bytes": 275569257, "sha256": "f378f66f77d219ae3215f9b8d4ee366f9974782b8aec4fda88464c55a3250ced" }
+  ]
+}
